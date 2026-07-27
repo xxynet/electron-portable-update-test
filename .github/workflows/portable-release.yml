@@ -1,0 +1,136 @@
+name: Build Portable Update Test Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version to build (for example, 1.0.1)'
+        required: true
+        type: string
+      previous_portable_release:
+        description: 'Release tag used as the differential-update baseline (empty: latest stable release)'
+        required: false
+        default: ''
+        type: string
+      flavor:
+        description: 'Visible label shown after the update'
+        required: false
+        default: 'GitHub stable update'
+        type: string
+      accent:
+        description: 'Visible CSS color shown after the update'
+        required: false
+        default: '#a3e635'
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: release
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'push') {
+            $version = '${{ github.ref_name }}'.TrimStart('v')
+            $tag = '${{ github.ref_name }}'
+          } else {
+            $version = '${{ inputs.version }}'
+            $tag = "v$version"
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw "Invalid semantic version: $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify JavaScript and Python syntax
+        run: npm run check
+
+      - name: Download previous Portable manifest
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_BASELINE: ${{ inputs.previous_portable_release }}
+        run: |
+          $baseline = $env:REQUESTED_BASELINE
+          if (-not $baseline) {
+            try { $baseline = gh release view --json tagName --jq .tagName 2>$null } catch {}
+          }
+          if (-not $baseline -or $baseline -eq '${{ steps.release.outputs.tag }}') {
+            Write-Output 'No previous release baseline; building a full package only.'
+            'path=' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path previous-portable | Out-Null
+          gh release download $baseline --pattern '*_win_manifest.json' --dir previous-portable --clobber
+          $downloadExit = $LASTEXITCODE
+          $downloaded = Get-ChildItem -Path previous-portable -Filter '*_win_manifest.json' | Select-Object -First 1
+          if ($downloadExit -ne 0 -or -not $downloaded) {
+            Write-Warning "No previous Portable manifest found for release $baseline; building a full package only."
+            'path=' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $manifest = 'previous-portable\previous-win-manifest.json'
+          Move-Item -LiteralPath $downloaded.FullName -Destination $manifest -Force
+          "path=$manifest" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows Portable assets
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          FLAVOR: ${{ inputs.flavor || 'GitHub tag release' }}
+          ACCENT: ${{ inputs.accent || '#38bdf8' }}
+          PREVIOUS_MANIFEST: ${{ steps.previous.outputs.path }}
+        run: |
+          $arguments = @('scripts/build-portable-release.js', '--version', $env:VERSION, '--flavor', $env:FLAVOR, '--accent', $env:ACCENT)
+          if ($env:PREVIOUS_MANIFEST) { $arguments += @('--previous', $env:PREVIOUS_MANIFEST) }
+          & node @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Portable build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-update-${{ steps.release.outputs.version }}
+          path: dist/releases/${{ steps.release.outputs.version }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create or update stable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $assets = Get-ChildItem -File -Path (Join-Path 'dist\releases' $env:VERSION) | ForEach-Object FullName
+          if (-not $assets) { throw 'No Portable assets were produced.' }
+          if (gh release view $env:TAG 2>$null) {
+            gh release upload $env:TAG $assets --clobber
+          } else {
+            gh release create $env:TAG $assets --title "Portable update test $env:VERSION" --generate-notes
+          }

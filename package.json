@@ -1,0 +1,46 @@
+{
+  "name": "electron-portable-update-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A fast end-to-end test bed for the N.E.K.O Portable update flow.",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "build:portable": "node scripts/build-portable-release.js",
+    "serve:update": "python scripts/run-local-update-service.py",
+    "check:updater-parity": "node scripts/check-updater-parity.js",
+    "check": "node --check src/main/index.js && node --check src/main/preload.js && node --check scripts/build-portable-release.js && python -m py_compile scripts/run-local-update-service.py backend/server.py"
+  },
+  "devDependencies": {
+    "archiver": "^7.0.1",
+    "electron": "41.2.0",
+    "electron-builder": "^26.15.2"
+  },
+  "build": {
+    "appId": "online.projectneko.portable-update-test",
+    "productName": "N.E.K.O",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend"
+      },
+      {
+        "from": "resources/build-info.json",
+        "to": "build-info.json"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": ["x64"]
+        }
+      ]
+    }
+  }
+}

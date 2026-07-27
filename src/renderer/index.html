@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Portable Update Test</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">N.E.K.O Portable updater · end-to-end test</p>
+      <h1>Electron Portable Update Test</h1>
+      <section class="build-card" id="build-card">
+        <span>当前构建</span>
+        <strong id="version">正在读取…</strong>
+        <p id="flavor"></p>
+      </section>
+      <section class="status-grid">
+        <article><span>后端</span><strong id="backend">检查中…</strong></article>
+        <article><span>更新状态</span><strong id="update-status">尚未检查</strong></article>
+      </section>
+      <button id="check-update">检查并应用 Portable 更新</button>
+      <p class="hint">更新确认框来自与 N.E.K.O 相同的更新检查服务；成功后应用会退出、替换文件并自动重启。</p>
+    </main>
+    <script src="renderer.js"></script>
+  </body>
+</html>

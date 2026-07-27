@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.local-update-data/
+__pycache__/
+*.py[cod]
+.build-*.log
+.rebuild-*.log
+.local-update-service.*.log
