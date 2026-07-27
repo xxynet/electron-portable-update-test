@@ -25,6 +25,7 @@ const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
 const ALLOWED_RELEASE_REPOSITORIES = new Set([
   DEFAULT_RELEASE_REPOSITORY,
   'xxynet/N.E.K.O',
+  'xxynet/electron-portable-update-test',
 ]);
 
 function normalizeArch(value) {
