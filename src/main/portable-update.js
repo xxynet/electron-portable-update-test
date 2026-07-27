@@ -20,6 +20,8 @@ const DISTRIBUTION_MARKER_NAME = 'neko-distribution.json';
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MAX_REDIRECTS = 5;
+const MAX_NETWORK_RETRIES = 2;
+const NETWORK_RETRY_DELAY_MS = 500;
 const SUPPORTED_ARCHES = new Set(['x64', 'arm64']);
 const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
 const ALLOWED_RELEASE_REPOSITORIES = new Set([
@@ -67,6 +69,14 @@ function isSafeSymlinkTarget(linkPath, value) {
 
 function isSha256(value) {
   return /^[a-f0-9]{64}$/.test(String(value || ''));
+}
+
+function retryTransientNetworkError(error, options, retry) {
+  const retryCount = Number(options.retryCount || 0);
+  if (!['ECONNRESET', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT'].includes(error?.code)
+    || retryCount >= MAX_NETWORK_RETRIES) return false;
+  setTimeout(retry, NETWORK_RETRY_DELAY_MS * (retryCount + 1));
+  return true;
 }
 
 function normalizeReleaseRepository(value, testReleaseRepository = null) {
@@ -321,6 +331,12 @@ function requestBuffer(urlValue, options = {}) {
   const maxBytes = options.maxBytes || MAX_MANIFEST_BYTES;
   const redirects = options.redirects || 0;
   return new Promise((resolve, reject) => {
+    const retryOrReject = (error) => {
+      if (retryTransientNetworkError(error, options, () => {
+        requestBuffer(urlValue, { ...options, retryCount: Number(options.retryCount || 0) + 1 }).then(resolve, reject);
+      })) return;
+      reject(error);
+    };
     if (redirects > MAX_REDIRECTS) {
       reject(new Error('portable_update_too_many_redirects'));
       return;
@@ -356,9 +372,9 @@ function requestBuffer(urlValue, options = {}) {
         chunks.push(buffer);
       });
       response.on('end', () => resolve(Buffer.concat(chunks)));
-      response.on('error', reject);
+      response.on('error', retryOrReject);
     });
-    request.on('error', reject);
+    request.on('error', retryOrReject);
     request.setTimeout?.(timeoutMs, () => request.destroy(new Error('portable_update_timeout')));
   });
 }
@@ -409,6 +425,16 @@ function downloadFile(urlValue, destination, options = {}) {
   const expectedSize = options.expectedSize;
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   return new Promise((resolve, reject) => {
+    let temporary = null;
+    const retryOrReject = (error) => {
+      if (temporary) {
+        try { fsRef.unlinkSync(temporary); } catch (_) {}
+      }
+      if (retryTransientNetworkError(error, options, () => {
+        downloadFile(urlValue, destination, { ...options, retryCount: Number(options.retryCount || 0) + 1 }).then(resolve, reject);
+      })) return;
+      reject(error);
+    };
     if (redirects > MAX_REDIRECTS) {
       reject(new Error('portable_update_too_many_redirects'));
       return;
@@ -432,7 +458,7 @@ function downloadFile(urlValue, destination, options = {}) {
         reject(new Error(`portable_update_http_${statusCode || 'unknown'}`));
         return;
       }
-      const temporary = `${destination}.part`;
+      temporary = `${destination}.part`;
       const output = fsRef.createWriteStream(temporary, { flags: 'w' });
       let received = 0;
       const contentLength = Number(response.headers?.['content-length']);
@@ -454,7 +480,7 @@ function downloadFile(urlValue, destination, options = {}) {
       response.on('error', (error) => output.destroy(error));
       output.on('error', (error) => {
         try { fsRef.unlinkSync(temporary); } catch (_) {}
-        reject(error);
+        retryOrReject(error);
       });
       output.on('finish', () => {
         output.close(() => {
@@ -469,7 +495,7 @@ function downloadFile(urlValue, destination, options = {}) {
       });
       response.pipe(output);
     });
-    request.on('error', reject);
+    request.on('error', retryOrReject);
     request.setTimeout?.(timeoutMs, () => request.destroy(new Error('portable_update_timeout')));
   });
 }
