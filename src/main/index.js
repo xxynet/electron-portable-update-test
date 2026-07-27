@@ -3,6 +3,7 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
+const https = require('node:https');
 const path = require('node:path');
 const { createUpdateCheckService } = require('./update-check-service');
 
@@ -54,6 +55,7 @@ app.whenReady().then(() => {
     app,
     dialog,
     shell,
+    https,
     log: (...values) => console.log(...values),
     onStatusChange: (status) => mainWindow?.webContents.send('update-status', status),
   });
