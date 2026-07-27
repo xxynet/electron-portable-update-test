@@ -58,13 +58,13 @@ npm run build:portable -- --version 1.0.1 --flavor 'Aurora / 更新后版本' --
 
 `.github/workflows/portable-release.yml` 复用 N.E.K.O 的 Windows Portable 发布路径：构建完整 ZIP 与 manifest，并从上一份 stable Release 下载 manifest 生成差分 ZIP。手动运行工作流或推送 `v*` tag 都会创建对应的正式 stable GitHub Release。
 
-GitHub 实测使用固定的 stable 测试选择器，不经过更新服务：先用较旧版本启动应用，再设置：
+GitHub 实测使用显式的 Portable 测试选择器，不经过更新服务：先用较旧版本启动应用，再设置：
 
 ```powershell
 $env:NEKO_PORTABLE_UPDATE_TEST_RELEASE = 'xxynet/electron-portable-update-test@stable'
 ```
 
-然后检查更新。该选择器只能读取上面的固定测试仓库 latest Release，不能被任意环境变量改为其他 GitHub 仓库。
+然后检查更新。值的格式为 `<owner/repo>@<stable|nightly>`；只有已打包的 Portable 进程会接受此显式测试配置，生产默认更新路径不受影响。
 
 ## 边界
 

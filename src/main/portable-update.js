@@ -25,7 +25,6 @@ const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
 const ALLOWED_RELEASE_REPOSITORIES = new Set([
   DEFAULT_RELEASE_REPOSITORY,
   'xxynet/N.E.K.O',
-  'xxynet/electron-portable-update-test',
 ]);
 
 function normalizeArch(value) {
@@ -70,19 +69,24 @@ function isSha256(value) {
   return /^[a-f0-9]{64}$/.test(String(value || ''));
 }
 
-function normalizeReleaseRepository(value) {
+function normalizeReleaseRepository(value, testReleaseRepository = null) {
   const repository = String(value || '').trim();
-  return ALLOWED_RELEASE_REPOSITORIES.has(repository) ? repository : null;
+  const configuredTestRepository = String(testReleaseRepository || '').trim();
+  return ALLOWED_RELEASE_REPOSITORIES.has(repository)
+    || (repository === configuredTestRepository && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository))
+    ? repository
+    : null;
 }
 
 function isAllowedReleaseAssetUrl(
   value,
   releaseRepository = DEFAULT_RELEASE_REPOSITORY,
   updateServiceBaseUrl = null,
+  testReleaseRepository = null,
 ) {
   if (isUpdateServiceDownloadUrl(value, updateServiceBaseUrl)) return true;
   try {
-    const repository = normalizeReleaseRepository(releaseRepository);
+    const repository = normalizeReleaseRepository(releaseRepository, testReleaseRepository);
     if (!repository) return false;
     const url = new URL(String(value || ''));
     return url.protocol === 'https:'
@@ -98,6 +102,7 @@ function findReleaseAsset(
   assetName,
   releaseRepository = DEFAULT_RELEASE_REPOSITORY,
   updateServiceBaseUrl = null,
+  testReleaseRepository = null,
 ) {
   const asset = Array.isArray(release?.assets)
     ? release.assets.find((candidate) => candidate?.name === assetName)
@@ -106,6 +111,7 @@ function findReleaseAsset(
     asset.browser_download_url,
     releaseRepository,
     updateServiceBaseUrl,
+    testReleaseRepository,
   )) return null;
   return asset;
 }
@@ -115,6 +121,7 @@ function findPortableManifestAsset(
   target = {},
   releaseRepository = DEFAULT_RELEASE_REPOSITORY,
   updateServiceBaseUrl = null,
+  testReleaseRepository = null,
 ) {
   const candidates = Array.isArray(release?.assets) ? release.assets : [];
   const targetKey = getTargetKey(target.platform, target.arch, target.distribution);
@@ -127,6 +134,7 @@ function findPortableManifestAsset(
         asset?.browser_download_url,
         releaseRepository,
         updateServiceBaseUrl,
+        testReleaseRepository,
       )
   )) || null;
 }
@@ -275,6 +283,7 @@ function selectPortablePackage(
   currentVersion,
   releaseRepository = DEFAULT_RELEASE_REPOSITORY,
   updateServiceBaseUrl = null,
+  testReleaseRepository = null,
 ) {
   const delta = (manifest.deltas || []).find((candidate) => candidate.fromVersion === currentVersion);
   const descriptor = delta || manifest.full;
@@ -283,6 +292,7 @@ function selectPortablePackage(
     descriptor.assetName,
     releaseRepository,
     updateServiceBaseUrl,
+    testReleaseRepository,
   );
   if (!asset) throw new Error(`portable_update_asset_missing:${descriptor.assetName}`);
   const fileMap = new Map((manifest.files || []).map((record) => [record.path, record]));
@@ -363,12 +373,14 @@ async function requestPortableManifest(release, expectedVersion, options = {}) {
       expectedAssetName,
       options.releaseRepository,
       options.updateServiceBaseUrl,
+      options.testReleaseRepository,
     )
     : findPortableManifestAsset(
       release,
       { ...target, version: expectedVersion },
       options.releaseRepository,
       options.updateServiceBaseUrl,
+      options.testReleaseRepository,
     );
   if (!asset) return null;
   const buffer = await requestBuffer(asset.browser_download_url, {
@@ -735,7 +747,8 @@ function createPortableUpdater(context = {}) {
   const httpRef = context.http || http;
   const httpsRef = context.https || https;
   const spawnRef = context.spawn || spawn;
-  const releaseRepository = normalizeReleaseRepository(context.releaseRepository)
+  const testReleaseRepository = String(context.testReleaseRepository || '').trim() || null;
+  const releaseRepository = normalizeReleaseRepository(context.releaseRepository, testReleaseRepository)
     || DEFAULT_RELEASE_REPOSITORY;
   const updateServiceBaseUrl = context.updateServiceBaseUrl || null;
   const quit = context.quit || (() => app.quit());
@@ -751,6 +764,7 @@ function createPortableUpdater(context = {}) {
       target,
       releaseRepository,
       updateServiceBaseUrl,
+      testReleaseRepository,
     });
     if (!manifest) return null;
     return {
@@ -761,6 +775,7 @@ function createPortableUpdater(context = {}) {
         currentVersion,
         releaseRepository,
         updateServiceBaseUrl,
+        testReleaseRepository,
       ),
       target,
     };

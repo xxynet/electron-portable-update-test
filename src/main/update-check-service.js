@@ -12,13 +12,7 @@ const {
 const DEFAULT_RELEASE_API_URL = 'https://api.github.com/repos/Project-N-E-K-O/N.E.K.O/releases/latest';
 const DEFAULT_RELEASES_URL_PREFIX = 'https://github.com/Project-N-E-K-O/N.E.K.O/releases/';
 const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
-const NIGHTLY_TEST_RELEASES = new Map([
-  ['Project-N-E-K-O/N.E.K.O@nightly', 'Project-N-E-K-O/N.E.K.O'],
-  ['xxynet/N.E.K.O@nightly', 'xxynet/N.E.K.O'],
-]);
-const STABLE_TEST_RELEASES = new Map([
-  ['xxynet/electron-portable-update-test@stable', 'xxynet/electron-portable-update-test'],
-]);
+const PORTABLE_TEST_RELEASE_SELECTOR = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)@(stable|nightly)$/;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEVELOPMENT_DOWNLOAD_SIMULATION_MS = 10000;
@@ -98,12 +92,14 @@ function detectDistributionMode(app, processRef = process) {
 function getNightlyTestReleaseConfig(app, processRef = process) {
   if (app?.isPackaged !== true || detectDistributionMode(app, processRef) !== 'portable') return null;
   const selector = String(processRef?.env?.NEKO_PORTABLE_UPDATE_TEST_RELEASE || '').trim();
-  const repository = NIGHTLY_TEST_RELEASES.get(selector) || STABLE_TEST_RELEASES.get(selector);
-  if (!repository) return null;
-  const tag = NIGHTLY_TEST_RELEASES.has(selector) ? 'nightly' : null;
+  const match = selector.match(PORTABLE_TEST_RELEASE_SELECTOR);
+  if (!match) return null;
+  const [, repository, channel] = match;
+  const tag = channel === 'nightly' ? 'nightly' : null;
   return {
     repository,
     tag,
+    channel,
     apiUrl: tag
       ? `https://api.github.com/repos/${repository}/releases/tags/${tag}`
       : `https://api.github.com/repos/${repository}/releases/latest`,
@@ -122,13 +118,12 @@ function getPortableReleaseVersion(release) {
   return versions.size === 1 ? [...versions][0] : null;
 }
 
-function isAllowedReleaseUrl(value, releaseRepository = DEFAULT_RELEASE_REPOSITORY) {
+function isAllowedReleaseUrl(value, releaseRepository = DEFAULT_RELEASE_REPOSITORY, allowTestRepository = false) {
   try {
     const url = new URL(String(value || ''));
     return url.protocol === 'https:'
       && url.hostname === 'github.com'
-      && (NIGHTLY_TEST_RELEASES.has(`${releaseRepository}@nightly`)
-        || STABLE_TEST_RELEASES.has(`${releaseRepository}@stable`))
+      && (releaseRepository === DEFAULT_RELEASE_REPOSITORY || allowTestRepository)
       && url.pathname.startsWith(`/${releaseRepository}/releases/`);
   } catch (_) {
     return false;
@@ -153,10 +148,11 @@ function createUpdateCheckService(context = {}) {
     setTimeout: setTimeoutRef = setTimeout,
   } = context;
 
-  const nightlyTestRelease = getNightlyTestReleaseConfig(app, processRef);
-  const releaseRepository = nightlyTestRelease?.repository || DEFAULT_RELEASE_REPOSITORY;
-  const effectiveReleaseApiUrl = nightlyTestRelease?.apiUrl || releaseApiUrl;
-  const releasesUrlPrefix = nightlyTestRelease?.releasesUrlPrefix || DEFAULT_RELEASES_URL_PREFIX;
+  const portableTestRelease = getNightlyTestReleaseConfig(app, processRef);
+  const isNightlyTestRelease = portableTestRelease?.channel === 'nightly';
+  const releaseRepository = portableTestRelease?.repository || DEFAULT_RELEASE_REPOSITORY;
+  const effectiveReleaseApiUrl = portableTestRelease?.apiUrl || releaseApiUrl;
+  const releasesUrlPrefix = portableTestRelease?.releasesUrlPrefix || DEFAULT_RELEASES_URL_PREFIX;
   let updateServiceBaseUrl = null;
   let updateServiceConfigurationError = null;
   try {
@@ -164,9 +160,9 @@ function createUpdateCheckService(context = {}) {
   } catch (error) {
     updateServiceConfigurationError = error;
   }
-  const updateServiceChannel = nightlyTestRelease ? 'nightly' : 'stable';
+  const updateServiceChannel = isNightlyTestRelease ? 'nightly' : 'stable';
   const canUseUpdateService = !!updateServiceBaseUrl
-    && (!nightlyTestRelease || releaseRepository === DEFAULT_RELEASE_REPOSITORY);
+    && (!portableTestRelease || releaseRepository === DEFAULT_RELEASE_REPOSITORY);
   const updateServiceReleaseApiUrl = canUseUpdateService
     ? buildUpdateServiceReleaseUrl(updateServiceBaseUrl, updateServiceChannel)
     : null;
@@ -179,6 +175,7 @@ function createUpdateCheckService(context = {}) {
     log,
     quit,
     releaseRepository,
+    testReleaseRepository: portableTestRelease?.repository || null,
     updateServiceBaseUrl,
   });
 
@@ -367,7 +364,7 @@ function createUpdateCheckService(context = {}) {
     { requireManifest = true } = {},
   ) {
     const release = await requestRelease(effectiveReleaseApiUrl, { github: true });
-    const latestVersion = nightlyTestRelease
+    const latestVersion = isNightlyTestRelease
       ? getPortableReleaseVersion(release)
       : String(release?.tag_name || '').trim().replace(/^v/i, '');
     if (!latestVersion || (expectedVersion && latestVersion !== expectedVersion)) {
@@ -459,9 +456,9 @@ function createUpdateCheckService(context = {}) {
     resolved,
     githubFallbackFactory = null,
   ) {
-    const releaseUrl = isAllowedReleaseUrl(release?.html_url, releaseRepository)
+    const releaseUrl = isAllowedReleaseUrl(release?.html_url, releaseRepository, !!portableTestRelease)
       ? release.html_url
-      : `${releasesUrlPrefix}${nightlyTestRelease ? 'tag/nightly' : 'latest'}`;
+      : `${releasesUrlPrefix}${isNightlyTestRelease ? 'tag/nightly' : 'latest'}`;
     const copy = getDialogCopy(currentVersion, latestVersion, release?.name, resolved);
     let accepted = false;
     if (typeof showUpdatePrompt === 'function') {
@@ -574,7 +571,7 @@ function createUpdateCheckService(context = {}) {
 
       const currentVersion = getCurrentVersion();
       const parsedCurrent = normalizeVersion(currentVersion);
-      if (!parsedCurrent || (parsedCurrent.prerelease.length > 0 && !nightlyTestRelease)) {
+      if (!parsedCurrent || (parsedCurrent.prerelease.length > 0 && !isNightlyTestRelease)) {
         writeLog('[Update] 跳过非稳定版本检查:', currentVersion || '<missing>');
         return { checked: false, reason: 'non_stable_current_version' };
       }
@@ -586,10 +583,10 @@ function createUpdateCheckService(context = {}) {
           : await requestLatestRelease();
         let { release } = releaseResult;
         let releaseSource = releaseResult.source;
-        const latestVersion = nightlyTestRelease
+        const latestVersion = isNightlyTestRelease
           ? getPortableReleaseVersion(release)
           : String(release?.tag_name || '').trim().replace(/^v/i, '');
-        const comparison = nightlyTestRelease
+        const comparison = isNightlyTestRelease
           ? (latestVersion ? (latestVersion === currentVersion ? 0 : 1) : null)
           : compareVersions(latestVersion, currentVersion);
         if (comparison === null) {
@@ -601,8 +598,8 @@ function createUpdateCheckService(context = {}) {
         }
 
         writeLog('[Update] 发现新版本:', `${currentVersion} -> ${latestVersion}`);
-        if (nightlyTestRelease) {
-          writeLog('[Update] 使用 Portable nightly 测试通道:', `${releaseRepository}@nightly (${latestVersion})`);
+        if (portableTestRelease) {
+          writeLog('[Update] 使用 Portable 测试通道:', `${releaseRepository}@${portableTestRelease.channel} (${latestVersion})`);
         }
         let resolved;
         let effectiveLatestVersion = latestVersion;
