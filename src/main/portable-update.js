@@ -19,6 +19,7 @@ const MANIFEST_SCHEMA_VERSION = 1;
 const DISTRIBUTION_MARKER_NAME = 'neko-distribution.json';
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30000;
+const PACKAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_REDIRECTS = 5;
 const MAX_NETWORK_RETRIES = 2;
 const NETWORK_RETRY_DELAY_MS = 500;
@@ -77,6 +78,12 @@ function retryTransientNetworkError(error, options, retry) {
     || retryCount >= MAX_NETWORK_RETRIES) return false;
   setTimeout(retry, NETWORK_RETRY_DELAY_MS * (retryCount + 1));
   return true;
+}
+
+function createTimeoutError() {
+  const error = new Error('portable_update_timeout');
+  error.code = 'ETIMEDOUT';
+  return error;
 }
 
 function normalizeReleaseRepository(value, testReleaseRepository = null) {
@@ -375,7 +382,7 @@ function requestBuffer(urlValue, options = {}) {
       response.on('error', retryOrReject);
     });
     request.on('error', retryOrReject);
-    request.setTimeout?.(timeoutMs, () => request.destroy(new Error('portable_update_timeout')));
+    request.setTimeout?.(timeoutMs, () => request.destroy(createTimeoutError()));
   });
 }
 
@@ -420,7 +427,7 @@ function downloadFile(urlValue, destination, options = {}) {
   const fsRef = options.fs || fs;
   const url = new URL(urlValue);
   const transport = url.protocol === 'http:' ? (options.http || http) : (options.https || https);
-  const timeoutMs = options.timeoutMs || DOWNLOAD_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs || PACKAGE_DOWNLOAD_TIMEOUT_MS;
   const redirects = options.redirects || 0;
   const expectedSize = options.expectedSize;
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
@@ -496,7 +503,7 @@ function downloadFile(urlValue, destination, options = {}) {
       response.pipe(output);
     });
     request.on('error', retryOrReject);
-    request.setTimeout?.(timeoutMs, () => request.destroy(new Error('portable_update_timeout')));
+    request.setTimeout?.(timeoutMs, () => request.destroy(createTimeoutError()));
   });
 }
 
