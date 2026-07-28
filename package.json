@@ -19,6 +19,7 @@
   "build": {
     "appId": "online.projectneko.portable-update-test",
     "productName": "N.E.K.O",
+    "electronDist": "node_modules/electron/dist",
     "asar": true,
     "files": [
       "src/**/*",
@@ -35,6 +36,7 @@
       }
     ],
     "win": {
+      "signAndEditExecutable": false,
       "target": [
         {
           "target": "dir",

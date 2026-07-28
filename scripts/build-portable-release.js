@@ -8,6 +8,13 @@ const ROOT = path.resolve(__dirname, '..');
 const PACKAGE_PATH = path.join(ROOT, 'package.json');
 const BUILD_INFO_PATH = path.join(ROOT, 'resources', 'build-info.json');
 
+function defaultAccentForFlavor(flavor) {
+  const normalized = String(flavor || '').trim().toLowerCase();
+  if (normalized.includes('aurora')) return '#2dd4bf';
+  if (normalized.includes('ocean')) return '#5b8cff';
+  return '#5b8cff';
+}
+
 function argument(name, required = true) {
   const index = process.argv.indexOf(`--${name}`);
   const value = index >= 0 ? process.argv[index + 1] : '';
@@ -25,7 +32,7 @@ function main() {
   const version = argument('version');
   const flavor = argument('flavor', false) || 'Ocean blue';
   const previous = argument('previous', false);
-  const accent = argument('accent', false) || '#2dd4bf';
+  const accent = argument('accent', false) || defaultAccentForFlavor(flavor);
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error(`Invalid version: ${version}`);
 
   const originalPackage = fs.readFileSync(PACKAGE_PATH, 'utf8');
