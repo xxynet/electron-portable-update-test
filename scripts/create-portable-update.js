@@ -145,16 +145,38 @@ function recordsEqual(left, right) {
     && left?.linkTarget === right?.linkTarget;
 }
 
-function calculateDelta(previous, latestFiles) {
+function deltaPathKey(filePath, platform) {
+  const value = String(filePath || '');
+  return platform === 'linux' ? value : value.toLowerCase();
+}
+
+function hasPathShapeConflict(changed, deleted, platform) {
+  const changedPaths = changed.map((record) => deltaPathKey(record.path, platform));
+  return deleted.some((removed) => {
+    const deletedPath = deltaPathKey(removed, platform);
+    return changedPaths.some((nextPath) => (
+      nextPath.startsWith(`${deletedPath}/`) || deletedPath.startsWith(`${nextPath}/`)
+    ));
+  });
+}
+
+function calculateDelta(previous, latestFiles, platform = previous?.platform || 'win32') {
   if (!previous) return null;
-  const previousFiles = new Map(previous.files.map((record) => [record.path, record]));
-  const latestPaths = new Set(latestFiles.map((record) => record.path));
-  const changed = latestFiles.filter((record) => !recordsEqual(previousFiles.get(record.path), record));
+  const previousFiles = new Map(previous.files.map((record) => [deltaPathKey(record.path, platform), record]));
+  const latestPaths = new Set(latestFiles.map((record) => deltaPathKey(record.path, platform)));
+  const changed = latestFiles.filter((record) => !recordsEqual(previousFiles.get(deltaPathKey(record.path, platform)), record));
   const deleted = previous.files
-    .filter((record) => !latestPaths.has(record.path))
+    .filter((record) => !latestPaths.has(deltaPathKey(record.path, platform)))
     .map((record) => record.path)
     .sort((left, right) => left.localeCompare(right, 'en'));
-  return { changed, deleted };
+  return {
+    changed,
+    deleted,
+    // Replacing a file with a directory (or the inverse) requires recursive
+    // backup/restore semantics. Publish a full archive for that release rather
+    // than emitting a delta which a platform helper could only apply partially.
+    hasPathShapeConflict: hasPathShapeConflict(changed, deleted, platform),
+  };
 }
 
 function defaultEntrypoint(platform) {
@@ -167,6 +189,23 @@ function markerResourcesDir(bundleDir, platform) {
   return platform === 'darwin'
     ? path.join(bundleDir, 'Contents', 'Resources')
     : path.join(bundleDir, 'resources');
+}
+
+async function writePortableManagedFilesInventory(bundleDir, platform) {
+  const resourcesDir = markerResourcesDir(bundleDir, platform);
+  const managedBeforeInventory = await collectManifestFiles(bundleDir, platform);
+  // electron-builder generates this sealed-resource file while signing. Seed
+  // it before signing so installed bundles never classify it as user data.
+  if (platform === 'darwin' && !managedBeforeInventory.some((record) => record.path === 'Contents/_CodeSignature/CodeResources')) {
+    managedBeforeInventory.push({ path: 'Contents/_CodeSignature/CodeResources' });
+  }
+  const inventoryPath = path.join(resourcesDir, 'neko-portable-managed-files.json');
+  fs.writeFileSync(inventoryPath, `${JSON.stringify({
+    schemaVersion: 1,
+    product: 'N.E.K.O',
+    files: managedBeforeInventory.map((record) => record.path),
+  }, null, 2)}\n`, 'utf8');
+  return inventoryPath;
 }
 
 async function buildPortableUpdate(options) {
@@ -189,16 +228,39 @@ async function buildPortableUpdate(options) {
   if (!fs.existsSync(path.join(bundleDir, ...entrypoint.split('/')))) {
     throw new Error(`Expected Portable entrypoint was not found: ${entrypoint}`);
   }
-  const marker = {
-    schemaVersion: 1,
-    distribution: platform === 'win32' ? 'zip-portable' : distribution,
-    product: 'N.E.K.O',
-    platform,
-    arch,
-    version,
-  };
-  fs.writeFileSync(path.join(resourcesDir, 'neko-distribution.json'), `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
-
+  const markerPath = path.join(resourcesDir, 'neko-distribution.json');
+  const inventoryPath = path.join(resourcesDir, 'neko-portable-managed-files.json');
+  if (platform === 'darwin') {
+    // electron-builder signs the .app after its afterPack hook.  Never mutate
+    // Contents/Resources here: doing so would invalidate the sealed bundle.
+    if (!fs.existsSync(markerPath) || !fs.existsSync(inventoryPath)) {
+      throw new Error('Expected Portable metadata from the pre-sign afterPack hook was not found');
+    }
+    let marker;
+    try { marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch (_) {}
+    if (marker?.schemaVersion !== 1
+      || marker?.distribution !== distribution
+      || marker?.product !== 'N.E.K.O'
+      || marker?.platform !== platform
+      || normalizeArch(marker?.arch) !== arch
+      || marker?.version !== version) {
+      throw new Error('Portable metadata from the pre-sign afterPack hook does not match this macOS artifact');
+    }
+  } else {
+    const marker = {
+      schemaVersion: 1,
+      distribution: platform === 'win32' ? 'zip-portable' : distribution,
+      product: 'N.E.K.O',
+      platform,
+      arch,
+      version,
+    };
+    fs.writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
+    // Keep an installed-side inventory in the Portable tree. A full update can
+    // then remove files that belonged to an older release without guessing that
+    // user-created files are application files.
+    await writePortableManagedFilesInventory(bundleDir, platform);
+  }
   const files = await collectManifestFiles(bundleDir, platform);
   const extension = platform === 'win32' ? '.zip' : '.tar.gz';
   const fullAssetName = `N.E.K.O_${version}_${targetKey}${extension}`;
@@ -221,19 +283,26 @@ async function buildPortableUpdate(options) {
 
   const previous = readPreviousManifest(options.previous, { platform, arch, distribution });
   if (previous && previous.version !== version) {
-    const delta = calculateDelta(previous, files);
+    const delta = calculateDelta(previous, files, platform);
     const deltaAssetName = `N.E.K.O_${previous.version}_to_${version}_${targetKey}_delta${extension}`;
     const deltaPath = path.join(outputDir, deltaAssetName);
-    if (platform === 'win32') await createZip(deltaPath, bundleDir, delta.changed);
-    else createTarGz(deltaPath, bundleDir, delta.changed);
-    manifest.deltas.push({
-      fromVersion: previous.version,
-      assetName: deltaAssetName,
-      size: fs.statSync(deltaPath).size,
-      sha256: await hashFile(deltaPath),
-      files: delta.changed.map((record) => record.path),
-      delete: delta.deleted,
-    });
+    if (!delta.hasPathShapeConflict) {
+      if (platform === 'win32') await createZip(deltaPath, bundleDir, delta.changed);
+      else createTarGz(deltaPath, bundleDir, delta.changed);
+      const deltaSize = fs.statSync(deltaPath).size;
+      if (deltaSize < manifest.full.size) {
+        manifest.deltas.push({
+          fromVersion: previous.version,
+          assetName: deltaAssetName,
+          size: deltaSize,
+          sha256: await hashFile(deltaPath),
+          files: delta.changed.map((record) => record.path),
+          delete: delta.deleted,
+        });
+      } else {
+        fs.unlinkSync(deltaPath);
+      }
+    }
   }
 
   validatePortableManifest(manifest, version, { platform, arch, distribution });
@@ -351,4 +420,5 @@ module.exports = {
   collectBlocks,
   collectManifestFiles,
   parseArgs,
+  writePortableManagedFilesInventory,
 };

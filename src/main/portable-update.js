@@ -19,14 +19,15 @@ const MANIFEST_SCHEMA_VERSION = 1;
 const DISTRIBUTION_MARKER_NAME = 'neko-distribution.json';
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30000;
+const PACKAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_REDIRECTS = 5;
 const MAX_NETWORK_RETRIES = 2;
 const NETWORK_RETRY_DELAY_MS = 500;
 const SUPPORTED_ARCHES = new Set(['x64', 'arm64']);
 const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
+const MANAGED_FILES_NAME = 'neko-portable-managed-files.json';
 const ALLOWED_RELEASE_REPOSITORIES = new Set([
   DEFAULT_RELEASE_REPOSITORY,
-  'xxynet/N.E.K.O',
 ]);
 
 function normalizeArch(value) {
@@ -79,13 +80,171 @@ function retryTransientNetworkError(error, options, retry) {
   return true;
 }
 
+function createTimeoutError() {
+  const error = new Error('portable_update_timeout');
+  error.code = 'ETIMEDOUT';
+  return error;
+}
+
+function createElectronNetTransport(netRef) {
+  if (!netRef || typeof netRef.request !== 'function') return null;
+  return {
+    get(urlValue, options, callback) {
+      // Electron follows redirects by default. Keep them manual so the same
+      // allowlist and redirect limit used by the Node transport applies here.
+      const request = netRef.request({ method: 'GET', url: urlValue, redirect: 'manual' });
+      for (const [name, value] of Object.entries(options?.headers || {})) {
+        request.setHeader?.(name, value);
+      }
+      request.on('response', callback);
+      // Electron ClientRequest has abort(), rather than Node's destroy(error).
+      // Keep the small Node-compatible surface used by the updater below.
+      if (typeof request.destroy !== 'function') {
+        request.destroy = (error) => {
+          try { request.abort?.(); } catch (_) {}
+          if (error) queueMicrotask(() => request.emit('error', error));
+        };
+      }
+      if (typeof request.setTimeout !== 'function') {
+        request.setTimeout = (timeoutMs, onTimeout) => {
+          let timer = null;
+          const clear = () => {
+            if (timer) clearTimeout(timer);
+            timer = null;
+          };
+          const arm = () => {
+            clear();
+            timer = setTimeout(() => {
+              timer = null;
+              onTimeout?.();
+            }, timeoutMs);
+          };
+          // Electron's ClientRequest has no socket-level timeout.  Keep an
+          // idle timer armed for the body as well as the connection: headers
+          // alone must not let a stalled manifest/package read hang forever.
+          arm();
+          request.once('response', (response) => {
+            response.on?.('data', arm);
+            response.once?.('end', clear);
+            response.once?.('error', clear);
+            response.once?.('close', clear);
+          });
+          request.once('error', clear);
+          request.once('abort', clear);
+          return request;
+        };
+      }
+      request.end();
+      return request;
+    },
+  };
+}
+
+function getManagedFilesPath(target) {
+  if (!target?.targetPath) return null;
+  const resourcesPath = target.platform === 'darwin'
+    ? path.join(target.targetPath, 'Contents', 'Resources')
+    : path.join(target.targetPath, 'resources');
+  return path.join(resourcesPath, MANAGED_FILES_NAME);
+}
+
+function getInstalledManagedFiles(target, fsRef = fs) {
+  const resourcesPrefix = target?.platform === 'darwin' ? 'Contents/Resources' : 'resources';
+  const managed = new Set([`${resourcesPrefix}/${DISTRIBUTION_MARKER_NAME}`]);
+  const inventoryPath = getManagedFilesPath(target);
+  if (!inventoryPath) return managed;
+  try {
+    const inventory = JSON.parse(fsRef.readFileSync(inventoryPath, 'utf8'));
+    if (inventory?.schemaVersion !== MANIFEST_SCHEMA_VERSION || inventory?.product !== 'N.E.K.O'
+      || !Array.isArray(inventory.files)) return managed;
+    for (const filePath of inventory.files) {
+      if (isSafeRelativePath(filePath)) managed.add(filePath);
+    }
+    managed.add(`${resourcesPrefix}/${MANAGED_FILES_NAME}`);
+  } catch (_) {}
+  return managed;
+}
+
+function managedPathKey(filePath, platform) {
+  const value = String(filePath || '');
+  return platform === 'linux' ? value : value.toLowerCase();
+}
+
+function collectUnmanagedPortableEntries(root, managedFiles, fsRef = fs, platform = 'win32') {
+  const entries = [];
+  const managed = new Set([...managedFiles].map((value) => managedPathKey(value, platform)));
+  const visit = (directory, prefix = '') => {
+    let children;
+    try { children = fsRef.readdirSync(directory, { withFileTypes: true }); } catch (_) { return false; }
+    for (const child of children) {
+      const relative = prefix ? `${prefix}/${child.name}` : child.name;
+      const absolute = path.join(directory, child.name);
+      const key = managedPathKey(relative, platform);
+      let stat;
+      try { stat = fsRef.lstatSync(absolute); } catch (_) { continue; }
+      // Electron's patched fs exposes an ASAR file as a virtual directory.
+      // Never descend into that virtual tree: its entries are part of a
+      // managed archive, not user files placed beside the Portable app.
+      const isAsarArchive = relative.toLowerCase().endsWith('.asar');
+      if (stat.isDirectory() && !stat.isSymbolicLink() && !isAsarArchive) {
+        const hasChildren = visit(absolute, relative);
+        // Empty user directories still carry user intent. Record them so a
+        // later managed file at the same path cannot silently replace them.
+        if (!hasChildren && !managed.has(key) && isSafeRelativePath(relative)) {
+          entries.push(relative);
+        }
+      } else if (!managed.has(key) && isSafeRelativePath(relative)) {
+        entries.push(relative);
+      }
+    }
+    return children.length > 0;
+  };
+  visit(root);
+  return entries;
+}
+
+function hasManagedPathConflict(filePath, managedFiles, platform = 'win32') {
+  const candidate = managedPathKey(filePath, platform);
+  return [...managedFiles].some((managedPath) => {
+    const managed = managedPathKey(managedPath, platform);
+    return candidate === managed
+      || candidate.startsWith(`${managed}/`)
+      || managed.startsWith(`${candidate}/`);
+  });
+}
+
+function findUnmanagedManagedConflicts(root, installedManagedFiles, targetManagedFiles, fsRef = fs, platform = 'win32') {
+  return collectUnmanagedPortableEntries(root, installedManagedFiles, fsRef, platform)
+    .filter((filePath) => hasManagedPathConflict(filePath, targetManagedFiles, platform));
+}
+
+function prunePortableUpdateCache(userDataPath, fsRef = fs) {
+  const cacheRoot = path.join(String(userDataPath || ''), 'portable-updates');
+  if (!userDataPath) return;
+  let versions;
+  try { versions = fsRef.readdirSync(cacheRoot, { withFileTypes: true }); } catch (_) { return; }
+  for (const entry of versions) {
+    if (!entry.isDirectory()) continue;
+    const versionDir = path.join(cacheRoot, entry.name);
+    let children;
+    try { children = fsRef.readdirSync(versionDir, { withFileTypes: true }); } catch (_) { continue; }
+    for (const child of children) {
+      // Keep the diagnostic log, but remove packages, plans, launchers and
+      // helpers left by a previously successful updater invocation.
+      if (child.name === 'portable-update.log') continue;
+      try { fsRef.rmSync(path.join(versionDir, child.name), { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+}
+
 function normalizeReleaseRepository(value, testReleaseRepository = null) {
   const repository = String(value || '').trim();
   const configuredTestRepository = String(testReleaseRepository || '').trim();
-  return ALLOWED_RELEASE_REPOSITORIES.has(repository)
-    || (repository === configuredTestRepository && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository))
-    ? repository
-    : null;
+  const isConfiguredTestRepository = repository === configuredTestRepository
+    && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(configuredTestRepository);
+  return (ALLOWED_RELEASE_REPOSITORIES.has(repository) || isConfiguredTestRepository)
+    && (!configuredTestRepository || repository === configuredTestRepository || repository === DEFAULT_RELEASE_REPOSITORY)
+    ? repository : null;
 }
 
 function isAllowedReleaseAssetUrl(
@@ -296,42 +455,90 @@ function selectPortablePackage(
   testReleaseRepository = null,
 ) {
   const delta = (manifest.deltas || []).find((candidate) => candidate.fromVersion === currentVersion);
-  const descriptor = delta || manifest.full;
-  const asset = findReleaseAsset(
-    release,
-    descriptor.assetName,
-    releaseRepository,
-    updateServiceBaseUrl,
-    testReleaseRepository,
-  );
-  if (!asset) throw new Error(`portable_update_asset_missing:${descriptor.assetName}`);
   const fileMap = new Map((manifest.files || []).map((record) => [record.path, record]));
-  return {
-    mode: delta ? 'delta' : 'full',
-    assetName: descriptor.assetName,
-    url: asset.browser_download_url,
-    size: descriptor.size,
-    sha256: descriptor.sha256,
-    allowUpdateServiceMirrors: isUpdateServiceDownloadUrl(
-      asset.browser_download_url,
+  const defaultEntrypoint = manifest.platform === 'win32'
+    ? 'N.E.K.O.exe'
+    : (manifest.platform === 'darwin' ? 'Contents/MacOS/N.E.K.O' : 'n.e.k.o');
+  const postApplyFullFiles = new Set([
+    manifest.entrypoint || defaultEntrypoint,
+    'resources/app.asar',
+    'Contents/Resources/app.asar',
+    `resources/${DISTRIBUTION_MARKER_NAME}`,
+    `Contents/Resources/${DISTRIBUTION_MARKER_NAME}`,
+    `resources/${MANAGED_FILES_NAME}`,
+    `Contents/Resources/${MANAGED_FILES_NAME}`,
+  ]);
+  const packageFor = (descriptor, mode, fullDelete = []) => {
+    const asset = findReleaseAsset(
+      release,
+      descriptor.assetName,
+      releaseRepository,
       updateServiceBaseUrl,
-    ),
-    files: manifest.distribution === 'appimage-portable'
-      ? []
-      : (delta ? delta.files.map((filePath) => fileMap.get(filePath)) : manifest.files),
-    delete: delta?.delete || [],
-    blocks: delta?.blocks || [],
+      testReleaseRepository,
+    );
+    if (!asset) return null;
+    return {
+      mode,
+      assetName: descriptor.assetName,
+      url: asset.browser_download_url,
+      size: descriptor.size,
+      sha256: descriptor.sha256,
+      allowUpdateServiceMirrors: isUpdateServiceDownloadUrl(
+        asset.browser_download_url,
+        updateServiceBaseUrl,
+      ),
+      files: manifest.distribution === 'appimage-portable'
+        ? []
+        : (mode === 'delta' ? descriptor.files.map((filePath) => fileMap.get(filePath)) : manifest.files),
+      // A full package is fully checked in the staging directory before an
+      // atomic directory swap. Re-hashing every file after that swap provides
+      // little extra assurance but can take minutes. Verify the executable,
+      // app archive, and updater metadata again instead. Delta updates touch
+      // an existing tree, so their final verification remains exhaustive.
+      postApplyVerifyFiles: manifest.distribution === 'appimage-portable'
+        ? []
+        : (mode === 'full'
+          ? manifest.files.filter((record) => postApplyFullFiles.has(record.path))
+          : manifest.files),
+      verifyFiles: manifest.distribution === 'appimage-portable' ? [] : manifest.files,
+      // A full package selected as a delta fallback must retain the delta's
+      // known removals. This lets directory updaters preserve user files while
+      // still removing files managed by the immediately preceding release.
+      delete: mode === 'delta' ? descriptor.delete || [] : fullDelete,
+      blocks: mode === 'delta' ? descriptor.blocks || [] : [],
+    };
   };
+  const selectedDelta = delta ? packageFor(delta, 'delta') : null;
+  const selected = selectedDelta || packageFor(manifest.full, 'full', delta?.delete || []);
+  if (!selected) throw new Error(`portable_update_asset_missing:${manifest.full.assetName}`);
+  if (selectedDelta) selected.fallbackPackage = packageFor(manifest.full, 'full', delta.delete || []);
+  return selected;
+}
+
+function resolvePortableRedirectUrl(location, urlValue, allowUpdateServiceMirrors) {
+  let nextUrl;
+  try {
+    nextUrl = new URL(String(location || ''), urlValue).toString();
+  } catch (_) {
+    throw new Error('portable_update_redirect_invalid');
+  }
+  if (!isAllowedUpdateRedirectUrl(nextUrl, allowUpdateServiceMirrors === true)) {
+    throw new Error('portable_update_redirect_rejected');
+  }
+  return nextUrl;
 }
 
 function requestBuffer(urlValue, options = {}) {
   const url = new URL(urlValue);
-  const transport = url.protocol === 'http:' ? (options.http || http) : (options.https || https);
+  const transport = options.transport || (url.protocol === 'http:' ? (options.http || http) : (options.https || https));
   const timeoutMs = options.timeoutMs || DOWNLOAD_TIMEOUT_MS;
   const maxBytes = options.maxBytes || MAX_MANIFEST_BYTES;
   const redirects = options.redirects || 0;
   return new Promise((resolve, reject) => {
+    let settled = false;
     const retryOrReject = (error) => {
+      if (settled) return;
+      settled = true;
       if (retryTransientNetworkError(error, options, () => {
         requestBuffer(urlValue, { ...options, retryCount: Number(options.retryCount || 0) + 1 }).then(resolve, reject);
       })) return;
@@ -346,12 +553,20 @@ function requestBuffer(urlValue, options = {}) {
     }, (response) => {
       const statusCode = Number(response.statusCode || 0);
       if ([301, 302, 303, 307, 308].includes(statusCode)) {
-        const nextUrl = new URL(String(response.headers?.location || ''), urlValue).toString();
-        response.resume?.();
-        if (!isAllowedUpdateRedirectUrl(nextUrl, options.allowUpdateServiceMirrors === true)) {
-          reject(new Error('portable_update_redirect_rejected'));
+        let nextUrl;
+        try {
+          nextUrl = resolvePortableRedirectUrl(
+            response.headers?.location,
+            urlValue,
+            options.allowUpdateServiceMirrors,
+          );
+        } catch (error) {
+          response.resume?.();
+          retryOrReject(error);
           return;
         }
+        response.resume?.();
+        settled = true;
         requestBuffer(nextUrl, { ...options, redirects: redirects + 1 }).then(resolve, reject);
         return;
       }
@@ -366,16 +581,22 @@ function requestBuffer(urlValue, options = {}) {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         received += buffer.length;
         if (received > maxBytes) {
-          response.destroy?.(new Error('portable_update_response_too_large'));
+          settled = true;
+          response.destroy?.();
+          reject(new Error('portable_update_response_too_large'));
           return;
         }
         chunks.push(buffer);
       });
-      response.on('end', () => resolve(Buffer.concat(chunks)));
+      response.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve(Buffer.concat(chunks));
+      });
       response.on('error', retryOrReject);
     });
     request.on('error', retryOrReject);
-    request.setTimeout?.(timeoutMs, () => request.destroy(new Error('portable_update_timeout')));
+    request.setTimeout?.(timeoutMs, () => request.destroy(createTimeoutError()));
   });
 }
 
@@ -419,14 +640,17 @@ async function requestPortableManifest(release, expectedVersion, options = {}) {
 function downloadFile(urlValue, destination, options = {}) {
   const fsRef = options.fs || fs;
   const url = new URL(urlValue);
-  const transport = url.protocol === 'http:' ? (options.http || http) : (options.https || https);
-  const timeoutMs = options.timeoutMs || DOWNLOAD_TIMEOUT_MS;
+  const transport = options.transport || (url.protocol === 'http:' ? (options.http || http) : (options.https || https));
+  const timeoutMs = options.timeoutMs || PACKAGE_DOWNLOAD_TIMEOUT_MS;
   const redirects = options.redirects || 0;
   const expectedSize = options.expectedSize;
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   return new Promise((resolve, reject) => {
     let temporary = null;
+    let settled = false;
     const retryOrReject = (error) => {
+      if (settled) return;
+      settled = true;
       if (temporary) {
         try { fsRef.unlinkSync(temporary); } catch (_) {}
       }
@@ -444,12 +668,20 @@ function downloadFile(urlValue, destination, options = {}) {
     }, (response) => {
       const statusCode = Number(response.statusCode || 0);
       if ([301, 302, 303, 307, 308].includes(statusCode)) {
-        const nextUrl = new URL(String(response.headers?.location || ''), urlValue).toString();
-        response.resume?.();
-        if (!isAllowedUpdateRedirectUrl(nextUrl, options.allowUpdateServiceMirrors === true)) {
-          reject(new Error('portable_update_redirect_rejected'));
+        let nextUrl;
+        try {
+          nextUrl = resolvePortableRedirectUrl(
+            response.headers?.location,
+            urlValue,
+            options.allowUpdateServiceMirrors,
+          );
+        } catch (error) {
+          response.resume?.();
+          retryOrReject(error);
           return;
         }
+        response.resume?.();
+        settled = true;
         downloadFile(nextUrl, destination, { ...options, redirects: redirects + 1 }).then(resolve, reject);
         return;
       }
@@ -467,6 +699,13 @@ function downloadFile(urlValue, destination, options = {}) {
         : (Number.isSafeInteger(contentLength) && contentLength > 0 ? contentLength : 0);
       response.on('data', (chunk) => {
         received += chunk.length;
+        if (Number.isSafeInteger(expectedSize) && received > expectedSize) {
+          const error = new Error(`portable_update_size_exceeded:${received}`);
+          output.destroy(error);
+          response.destroy?.(error);
+          retryOrReject(error);
+          return;
+        }
         if (onProgress) {
           try {
             onProgress({
@@ -484,19 +723,24 @@ function downloadFile(urlValue, destination, options = {}) {
       });
       output.on('finish', () => {
         output.close(() => {
+          if (settled) return;
           if (Number.isSafeInteger(expectedSize) && received !== expectedSize) {
-            try { fsRef.unlinkSync(temporary); } catch (_) {}
-            reject(new Error(`portable_update_size_mismatch:${received}`));
+            retryOrReject(new Error(`portable_update_size_mismatch:${received}`));
             return;
           }
-          fsRef.renameSync(temporary, destination);
-          resolve({ path: destination, size: received });
+          try {
+            fsRef.renameSync(temporary, destination);
+            settled = true;
+            resolve({ path: destination, size: received });
+          } catch (error) {
+            retryOrReject(error);
+          }
         });
       });
       response.pipe(output);
     });
     request.on('error', retryOrReject);
-    request.setTimeout?.(timeoutMs, () => request.destroy(new Error('portable_update_timeout')));
+    request.setTimeout?.(timeoutMs, () => request.destroy(createTimeoutError()));
   });
 }
 
@@ -541,8 +785,11 @@ function getDistributionMarker(resourcesPath, fsRef = fs) {
 function resolvePortableTarget(processRef = process, fsRef = fs) {
   const platform = processRef.platform;
   const arch = normalizeArch(processRef.arch);
+  // electron-builder's single-file Portable target exposes these variables.
+  // Its parent directory belongs to the user (commonly Downloads), not to the
+  // extracted application, so it must never be treated as a directory package.
   if (platform === 'win32' && (processRef.env?.PORTABLE_EXECUTABLE_FILE || processRef.env?.PORTABLE_EXECUTABLE_DIR)) {
-    return { platform, arch: arch || 'x64', distribution: 'archive-portable', targetPath: getPortableRoot(processRef) };
+    return null;
   }
   if (platform === 'linux' && processRef.env?.APPIMAGE) {
     let targetPath = path.resolve(processRef.env.APPIMAGE);
@@ -616,9 +863,47 @@ function Write-UpdateLog([string]$Message) {
   $line = ('[{0}] {1}' -f ([DateTime]::UtcNow.ToString('o')), $Message)
   try { Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8 } catch { }
 }
+$progressForm = $null
+$progressLabel = $null
+function Show-UpdateProgress([string]$Message) {
+  Write-UpdateLog $Message
+  if ([string]$env:NEKO_PORTABLE_UPDATE_NO_UI -eq '1') { return }
+  try {
+    if ($null -eq $progressForm) {
+      Add-Type -AssemblyName System.Windows.Forms
+      $progressForm = New-Object -TypeName System.Windows.Forms.Form
+      $progressForm.Text = 'N.E.K.O. Update'
+      $progressForm.StartPosition = 'CenterScreen'
+      $progressForm.FormBorderStyle = 'FixedDialog'
+      $progressForm.ControlBox = $false
+      $progressForm.MaximizeBox = $false
+      $progressForm.MinimizeBox = $false
+      $progressForm.Width = 420
+      $progressForm.Height = 132
+      $progressLabel = New-Object -TypeName System.Windows.Forms.Label
+      $progressLabel.AutoSize = $false
+      $progressLabel.Left = 24
+      $progressLabel.Top = 30
+      $progressLabel.Width = 372
+      $progressLabel.Height = 64
+      $progressLabel.TextAlign = 'MiddleCenter'
+      [void]$progressForm.Controls.Add($progressLabel)
+      $progressForm.Show()
+    }
+    $progressLabel.Text = $Message
+    [System.Windows.Forms.Application]::DoEvents()
+  } catch {
+    Write-UpdateLog ('Update progress UI unavailable: ' + $_.Exception.Message)
+  }
+}
+function Close-UpdateProgress() {
+  try { if ($null -ne $progressForm) { $progressForm.Close(); $progressForm.Dispose() } } catch { }
+  $progressForm = $null
+  $progressLabel = $null
+}
 $readyPath = $readyPath.Trim()
 if ([string]::IsNullOrWhiteSpace($readyPath)) { throw 'helper_ready_path_missing' }
-Write-UpdateLog ('Waiting for process ' + $planData.currentPid)
+Show-UpdateProgress 'Preparing update. Waiting for N.E.K.O. to close...'
 try { New-Item -ItemType File -Path $readyPath -Force | Out-Null } catch { Write-UpdateLog ('Update helper readiness failed: ' + $_.Exception.Message); throw }
 function Resolve-SafePath([string]$Root, [string]$Relative) {
   if ([string]::IsNullOrWhiteSpace($Relative) -or [IO.Path]::IsPathRooted($Relative) -or $Relative.Contains(':') -or $Relative.Contains('\')) { throw 'unsafe_relative_path' }
@@ -628,6 +913,14 @@ function Resolve-SafePath([string]$Root, [string]$Relative) {
   $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
   if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'path_escaped_root' }
   return $candidate
+}
+function Assert-HelperPath([string]$Value, [string]$Root, [string]$Name) {
+  if ([string]::IsNullOrWhiteSpace($Value) -or [string]::IsNullOrWhiteSpace($Root)) { throw ('helper_' + $Name + '_missing') }
+  $valueFull = [IO.Path]::GetFullPath($Value)
+  $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+  $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
+  if (-not $valueFull.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw ('helper_' + $Name + '_outside_root') }
+  return $valueFull
 }
 function Assert-ArchiveFiles([string]$Root, $Files) {
   foreach ($file in $Files) {
@@ -671,6 +964,15 @@ function Copy-WithRetry([string]$Source, [string]$Destination) {
   }
   throw $lastError
 }
+function Copy-PreservedEntries([string]$SourceRoot, [string]$DestinationRoot, $Entries) {
+  foreach ($relative in $Entries) {
+    $source = Resolve-SafePath $SourceRoot ([string]$relative)
+    if (-not (Test-Path -LiteralPath $source)) { continue }
+    $destination = Resolve-SafePath $DestinationRoot ([string]$relative)
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-WithRetry $source $destination
+  }
+}
 function Remove-WithRetry([string]$Target) {
   $lastError = $null
   for ($attempt = 0; $attempt -lt 60; $attempt++) {
@@ -681,33 +983,64 @@ function Remove-WithRetry([string]$Target) {
 $targetDir = [IO.Path]::GetFullPath([string]$planData.targetDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
 $parentDir = Split-Path -Parent $targetDir
 $token = [string]$planData.token
+$expectedTargetDir = [IO.Path]::GetFullPath([string]$env:NEKO_PORTABLE_UPDATE_TARGET_DIR).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$expectedUpdateRoot = [IO.Path]::GetFullPath([string]$env:NEKO_PORTABLE_UPDATE_ROOT).TrimEnd([IO.Path]::DirectorySeparatorChar)
+if ($targetDir -ne $expectedTargetDir) { throw 'helper_target_dir_changed' }
+if ($token -notmatch '^[0-9A-Za-z-]+$') { throw 'helper_token_invalid' }
+$planPathFull = Assert-HelperPath $Plan $expectedUpdateRoot 'plan'
+$scriptPathFull = Assert-HelperPath $PSCommandPath $expectedUpdateRoot 'script'
+$archivePath = Assert-HelperPath ([string]$planData.archivePath) $expectedUpdateRoot 'archive'
+$logPath = Assert-HelperPath ([string]$planData.logPath) $expectedUpdateRoot 'log'
+$readyPath = Assert-HelperPath ([string]$planData.readyPath) $expectedUpdateRoot 'ready'
+$expectedExecutable = [string]$env:NEKO_PORTABLE_UPDATE_ENTRYPOINT
+if ($expectedExecutable -ne [string]$planData.executableRelativePath) { throw 'helper_entrypoint_changed' }
+if (-not (Test-Path -LiteralPath $targetDir -PathType Container)) { throw 'helper_target_dir_missing' }
 $stagingDir = Join-Path $parentDir ('.neko-update-staging-' + $token)
 $backupDir = Join-Path $parentDir ('.neko-update-backup-' + $token)
 $success = $false
+$applicationExitTimedOut = $false
 try {
   $running = Get-Process -Id ([int]$planData.currentPid) -ErrorAction SilentlyContinue
   if ($null -ne $running) { Wait-Process -Id ([int]$planData.currentPid) -Timeout 180 -ErrorAction SilentlyContinue }
-  if ($null -ne (Get-Process -Id ([int]$planData.currentPid) -ErrorAction SilentlyContinue)) { throw 'application_exit_timeout' }
+  if ($null -ne (Get-Process -Id ([int]$planData.currentPid) -ErrorAction SilentlyContinue)) { $applicationExitTimedOut = $true; throw 'application_exit_timeout' }
   Start-Sleep -Seconds 2
+  Show-UpdateProgress 'Extracting update files...'
   if (Test-Path -LiteralPath $stagingDir) { Remove-Item -LiteralPath $stagingDir -Recurse -Force }
   if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force }
   New-Item -ItemType Directory -Path $stagingDir | Out-Null
   Write-UpdateLog ('Extracting ' + $planData.archivePath)
   Assert-ArchiveEntries ([string]$planData.archivePath) $stagingDir $planData.files
   Expand-Archive -LiteralPath ([string]$planData.archivePath) -DestinationPath $stagingDir -Force
+  Show-UpdateProgress 'Verifying downloaded update...'
   Assert-ArchiveFiles $stagingDir $planData.files
-  # Full ZIPs are overlaid just like a large delta. This preserves files the
-  # user may have placed in the Portable directory; only an explicit delta
-  # delete list is allowed to remove paths.
-  New-Item -ItemType Directory -Path $backupDir | Out-Null
-  $applied = New-Object System.Collections.ArrayList
-  try {
+  if ([string]$planData.mode -eq 'full') {
+      Move-WithRetry $targetDir $backupDir
+      try {
+        Copy-PreservedEntries $backupDir $stagingDir $planData.preserveEntries
+        Move-WithRetry $stagingDir $targetDir
+        Show-UpdateProgress 'Verifying installed update...'
+        Assert-ArchiveFiles $targetDir $planData.postApplyVerifyFiles
+        $executable = Resolve-SafePath $targetDir ([string]$planData.executableRelativePath)
+        Write-UpdateLog ('Starting updated application ' + $executable)
+        Start-Process -FilePath $executable -WorkingDirectory $targetDir
+        $success = $true
+        Write-UpdateLog ('Update completed: ' + $planData.targetVersion)
+      } catch {
+        if (Test-Path -LiteralPath $targetDir) { Remove-Item -LiteralPath $targetDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $backupDir) { Move-WithRetry $backupDir $targetDir }
+        throw
+      }
+  } else {
+    New-Item -ItemType Directory -Path $backupDir | Out-Null
+    $applied = New-Object System.Collections.ArrayList
+    try {
+      Show-UpdateProgress 'Applying differential update...'
       foreach ($file in $planData.files) {
         $source = Resolve-SafePath $stagingDir ([string]$file.path)
         $target = Resolve-SafePath $targetDir ([string]$file.path)
         $backup = Resolve-SafePath $backupDir ([string]$file.path)
         $existed = Test-Path -LiteralPath $target -PathType Leaf
-        if ([string]$planData.mode -eq 'full' -and $existed -and (Get-Item -LiteralPath $target).Length -eq [long]$file.size) {
+        if ($existed -and (Get-Item -LiteralPath $target).Length -eq [long]$file.size) {
           $currentHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($currentHash -eq ([string]$file.sha256).ToLowerInvariant()) { continue }
         }
@@ -726,6 +1059,8 @@ try {
           Remove-WithRetry $target
         }
       }
+      Show-UpdateProgress 'Verifying installed update...'
+      Assert-ArchiveFiles $targetDir $planData.postApplyVerifyFiles
       $executable = Resolve-SafePath $targetDir ([string]$planData.executableRelativePath)
       Write-UpdateLog ('Starting updated application ' + $executable)
       Start-Process -FilePath $executable -WorkingDirectory $targetDir
@@ -740,17 +1075,22 @@ try {
         elseif (-not $item.existed -and (Test-Path -LiteralPath $target -PathType Leaf)) { Remove-WithRetry $target }
       }
       throw
+    }
   }
 } catch {
   Write-UpdateLog ('Update failed: ' + $_.Exception.Message)
+  Show-UpdateProgress 'Update failed. Restoring the previous version...'
   try {
     if (-not (Test-Path -LiteralPath $targetDir) -and (Test-Path -LiteralPath $backupDir)) { Move-WithRetry $backupDir $targetDir }
     $oldExecutable = Resolve-SafePath $targetDir ([string]$planData.executableRelativePath)
-    if (Test-Path -LiteralPath $oldExecutable -PathType Leaf) { Start-Process -FilePath $oldExecutable -WorkingDirectory $targetDir }
+    if (-not $applicationExitTimedOut -and (Test-Path -LiteralPath $oldExecutable -PathType Leaf)) { Start-Process -FilePath $oldExecutable -WorkingDirectory $targetDir }
   } catch { Write-UpdateLog ('Rollback/restart failed: ' + $_.Exception.Message) }
+  Start-Sleep -Seconds 3
 } finally {
   if (Test-Path -LiteralPath $stagingDir) { Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue }
   if ($success -and (Test-Path -LiteralPath $backupDir)) { Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue }
+  if ($success) { Remove-Item -LiteralPath ([string]$planData.archivePath) -Force -ErrorAction SilentlyContinue }
+  Close-UpdateProgress
 }
 if (-not $success) { exit 1 }
 `;
@@ -772,6 +1112,7 @@ function createPortableUpdater(context = {}) {
   const fsRef = context.fs || fs;
   const httpRef = context.http || http;
   const httpsRef = context.https || https;
+  const electronNetTransport = createElectronNetTransport(context.net);
   const spawnRef = context.spawn || spawn;
   const testReleaseRepository = String(context.testReleaseRepository || '').trim() || null;
   const releaseRepository = normalizeReleaseRepository(context.releaseRepository, testReleaseRepository)
@@ -779,6 +1120,7 @@ function createPortableUpdater(context = {}) {
   const updateServiceBaseUrl = context.updateServiceBaseUrl || null;
   const quit = context.quit || (() => app.quit());
   const writeLog = (...args) => { try { context.log?.(...args); } catch (_) {} };
+  try { prunePortableUpdateCache(app?.getPath?.('userData'), fsRef); } catch (_) {}
 
   async function resolve(release, currentVersion, latestVersion) {
     const target = resolvePortableTarget(processRef, fsRef);
@@ -786,6 +1128,7 @@ function createPortableUpdater(context = {}) {
     const manifest = await requestPortableManifest(release, latestVersion, {
       https: httpsRef,
       http: httpRef,
+      transport: electronNetTransport,
       userAgent: `N.E.K.O/${currentVersion}`,
       target,
       releaseRepository,
@@ -812,24 +1155,43 @@ function createPortableUpdater(context = {}) {
     const targetVersion = resolved.manifest.version;
     const target = resolved.target || resolvePortableTarget(processRef, fsRef);
     if (!target) throw new Error('portable_update_target_unavailable');
+    const installedManagedFiles = getInstalledManagedFiles(target, fsRef);
+    const targetManagedFiles = new Set(packageInfo.verifyFiles.map((file) => file.path));
+    const unmanagedConflicts = findUnmanagedManagedConflicts(
+      target.targetPath,
+      installedManagedFiles,
+      targetManagedFiles,
+      fsRef,
+      target.platform,
+    );
+    if (unmanagedConflicts.length > 0) {
+      throw new Error(`portable_update_unmanaged_path_conflict:${unmanagedConflicts[0]}`);
+    }
     const updateRoot = path.join(app.getPath('userData'), 'portable-updates', targetVersion);
     fsRef.mkdirSync(updateRoot, { recursive: true });
     const archivePath = path.join(updateRoot, packageInfo.assetName);
     try { fsRef.unlinkSync(archivePath); } catch (_) {}
     writeLog('[Update] 开始下载 Portable 更新:', packageInfo.assetName);
-    await downloadFile(packageInfo.url, archivePath, {
-      fs: fsRef,
-      http: httpRef,
-      https: httpsRef,
-      expectedSize: packageInfo.size,
-      userAgent: `N.E.K.O/${app.getVersion()}`,
-      onProgress: options.onProgress,
-      allowUpdateServiceMirrors: packageInfo.allowUpdateServiceMirrors === true,
-    });
-    const actualHash = await hashFile(archivePath, fsRef);
-    if (actualHash !== packageInfo.sha256) {
+    try {
+      await downloadFile(packageInfo.url, archivePath, {
+        fs: fsRef,
+        http: httpRef,
+        https: httpsRef,
+        transport: electronNetTransport,
+        expectedSize: packageInfo.size,
+        userAgent: `N.E.K.O/${app.getVersion()}`,
+        onProgress: options.onProgress,
+        allowUpdateServiceMirrors: packageInfo.allowUpdateServiceMirrors === true,
+      });
+      const actualHash = await hashFile(archivePath, fsRef);
+      if (actualHash !== packageInfo.sha256) throw new Error('portable_update_archive_hash_mismatch');
+    } catch (error) {
       try { fsRef.unlinkSync(archivePath); } catch (_) {}
-      throw new Error('portable_update_archive_hash_mismatch');
+      if (packageInfo.mode === 'delta' && packageInfo.fallbackPackage) {
+        writeLog('[Update] 增量包不可用，回退全量包:', error?.message || error);
+        return downloadAndApply({ ...resolved, package: packageInfo.fallbackPackage }, options);
+      }
+      throw error;
     }
 
     const targetDir = target.targetPath;
@@ -841,6 +1203,16 @@ function createPortableUpdater(context = {}) {
     const scriptPath = path.join(updateRoot, processRef.platform === 'win32' ? 'apply-portable-update.ps1' : 'apply-portable-update.sh');
     const launcherPath = path.join(updateRoot, 'launch-portable-update.cmd');
     try { fsRef.unlinkSync(readyPath); } catch (_) {}
+    const obsoleteManagedFiles = packageInfo.mode === 'full'
+      ? [...installedManagedFiles].filter((filePath) => !targetManagedFiles.has(filePath))
+      : packageInfo.delete;
+    const preserveEntries = packageInfo.mode === 'full' && target.platform === 'win32'
+      ? collectUnmanagedPortableEntries(
+        target.targetPath,
+        new Set([...installedManagedFiles, ...targetManagedFiles]),
+        fsRef,
+      ).filter((filePath) => !hasManagedPathConflict(filePath, targetManagedFiles))
+      : [];
     const plan = {
       schemaVersion: MANIFEST_SCHEMA_VERSION,
       mode: packageInfo.mode,
@@ -851,10 +1223,20 @@ function createPortableUpdater(context = {}) {
       archivePath,
       targetVersion,
       files: packageInfo.files,
-      delete: packageInfo.delete,
+      verifyFiles: packageInfo.verifyFiles,
+      postApplyVerifyFiles: packageInfo.postApplyVerifyFiles,
+      delete: [...new Set([...packageInfo.delete, ...obsoleteManagedFiles])],
+      preserveEntries,
       logPath,
       readyPath,
     };
+    try {
+      options.onStage?.({
+        phase: 'installing',
+        mode: packageInfo.mode,
+        version: targetVersion,
+      });
+    } catch (_) {}
     let helperCommand;
     let helperArgs;
     if (processRef.platform === 'win32') {
@@ -891,6 +1273,12 @@ function createPortableUpdater(context = {}) {
       detached: true,
       windowsHide: processRef.platform === 'win32',
       stdio: 'ignore',
+      env: {
+        ...(processRef.env || process.env),
+        NEKO_PORTABLE_UPDATE_TARGET_DIR: targetDir,
+        NEKO_PORTABLE_UPDATE_ROOT: updateRoot,
+        NEKO_PORTABLE_UPDATE_ENTRYPOINT: executableRelativePath,
+      },
     });
     await waitForChildSpawn(child);
     await waitForHelperReady(readyPath, { fsRef });
@@ -908,13 +1296,19 @@ module.exports = {
   buildUpdaterLauncherCmd,
   buildUpdaterPowerShell,
   createPortableUpdater,
+  createElectronNetTransport,
   downloadFile,
   findPortableManifestAsset,
+  findUnmanagedManagedConflicts,
   getDistributionMarker,
+  getInstalledManagedFiles,
   getTargetKey,
   isAllowedReleaseAssetUrl,
   isSafeRelativePath,
+  collectUnmanagedPortableEntries,
   normalizeArch,
+  prunePortableUpdateCache,
+  requestBuffer,
   resolvePortableTarget,
   requestPortableManifest,
   selectPortablePackage,

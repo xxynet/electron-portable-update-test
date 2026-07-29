@@ -29,10 +29,20 @@ ready_path=${shellQuote(readyPath)}
 token=${shellQuote(token)}
 current_pid=${shellQuote(plan.currentPid)}
 platform=${shellQuote(platform)}
+application_exit_timeout=0
 
 log() {
   timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)
   printf '[%s] %s\\n' "$timestamp" "$1" >> "$log_path" 2>/dev/null || true
+}
+
+notify_update() {
+  message=$1
+  if [ "$platform" = darwin ] && command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$message\" with title \"N.E.K.O. Update\"" >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send 'N.E.K.O. Update' "$message" >/dev/null 2>&1 || true
+  fi
 }
 
 : > "$ready_path"
@@ -55,16 +65,18 @@ file_mode() {
 
 waited=0
 while kill -0 "$current_pid" 2>/dev/null; do
-  if [ "$waited" -ge 180 ]; then log 'Update failed: application_exit_timeout'; exit 1; fi
+  if [ "$waited" -ge 180 ]; then application_exit_timeout=1; log 'Update failed: application_exit_timeout'; exit 1; fi
   sleep 1
   waited=$((waited + 1))
 done
 sleep 1
+notify_update 'Installing update. N.E.K.O. will restart automatically.'
 `;
 }
 
 function buildArchiveUpdaterShell(plan) {
   const files = Array.isArray(plan.files) ? plan.files : [];
+  const verifyFiles = Array.isArray(plan.verifyFiles) ? plan.verifyFiles : files;
   const deletes = Array.isArray(plan.delete) ? plan.delete : [];
   const targetParent = path.posix.dirname(plan.targetPath);
   const targetName = path.posix.basename(plan.targetPath);
@@ -72,6 +84,7 @@ function buildArchiveUpdaterShell(plan) {
   const backup = path.posix.join(targetParent, `.${targetName}.neko-backup-${plan.token}`);
   const expected = path.posix.join(path.posix.dirname(plan.logPath), `archive-entries-${plan.token}.txt`);
   const actual = path.posix.join(path.posix.dirname(plan.logPath), `archive-actual-${plan.token}.txt`);
+  const raw = path.posix.join(path.posix.dirname(plan.logPath), `archive-raw-${plan.token}.txt`);
   const entrypoint = assertPlanPath(plan.entrypoint);
   const filePaths = files.map((record) => assertPlanPath(record.path));
 
@@ -80,6 +93,7 @@ function buildArchiveUpdaterShell(plan) {
 backup=${shellQuote(backup)}
 expected=${shellQuote(expected)}
 actual=${shellQuote(actual)}
+raw=${shellQuote(raw)}
 entrypoint=${shellQuote(entrypoint)}
 success=0
 swapped=0
@@ -98,15 +112,17 @@ cleanup() {
   trap - EXIT INT TERM HUP
   if [ "$success" -ne 1 ]; then
     log "Update failed with status $status"
+    notify_update 'Update failed. Restoring the previous version.'
     if [ "$swapped" -eq 1 ] && [ -e "$backup" ]; then
       rm -rf "$target" 2>/dev/null || true
       mv "$backup" "$target" 2>/dev/null || true
     fi
-    if [ -e "$target" ]; then start_app >/dev/null 2>&1 || true; fi
+    if [ "$application_exit_timeout" -ne 1 ] && [ -e "$target" ]; then start_app >/dev/null 2>&1 || true; fi
   fi
   rm -rf "$staging" 2>/dev/null || true
   if [ "$success" -eq 1 ]; then rm -rf "$backup" 2>/dev/null || true; fi
-  rm -f "$expected" "$actual" 2>/dev/null || true
+  rm -f "$expected" "$actual" "$raw" 2>/dev/null || true
+  if [ "$success" -eq 1 ]; then rm -f "$archive" 2>/dev/null || true; fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
@@ -115,17 +131,53 @@ rm -rf "$staging" "$backup"
 mkdir -p "$staging"
 `;
 
-  if (plan.platform === 'darwin') {
-    if (plan.mode === 'delta') script += 'ditto "$target" "$staging"\n';
-  } else {
-    script += 'cp -a "$target"/. "$staging"/\n';
+  // Linux Portable promises to retain files that are not part of the release.
+  // A full archive therefore overlays a staged copy of the old tree too. For a
+  // delta fallback, `delete` carries the known removals from that delta.
+  if (plan.mode === 'delta' || plan.platform === 'linux') {
+    if (plan.platform === 'darwin') script += 'ditto "$target" "$staging"\n';
+    else script += 'cp -a "$target"/. "$staging"/\n';
   }
 
+  script += `remove_conflicting_path() {
+  relative=$1
+  current="$staging"
+  old_ifs=$IFS
+  set -f
+  IFS=/
+  set -- $relative
+  IFS=$old_ifs
+  for part in "$@"; do
+    current="$current/$part"
+    if [ -L "$current" ]; then rm -f "$current"; fi
+  done
+  set +f
+  rm -rf "$staging/$relative"
+}
+remove_deleted_path() {
+  relative=$1
+  current="$staging"
+  old_ifs=$IFS
+  set -f
+  IFS=/
+  set -- $relative
+  IFS=$old_ifs
+  for part in "$@"; do
+    current="$current/$part"
+    # Never traverse a user-provided symlink while handling a deletion.
+    if [ -L "$current" ]; then set +f; return 0; fi
+  done
+  set +f
+  # A release deletion only authorizes removal of the old managed leaf. If a
+  # user replaced it with a directory, retain that directory and its contents.
+  if [ -L "$staging/$relative" ] || [ -f "$staging/$relative" ]; then rm -f "$staging/$relative"; fi
+}
+`;
   for (const record of files) {
-    script += `rm -rf "$staging"/${shellQuote(record.path)}\n`;
+    script += `remove_conflicting_path ${shellQuote(record.path)}\n`;
   }
   for (const relative of deletes) {
-    script += `rm -rf "$staging"/${shellQuote(assertPlanPath(relative))}\n`;
+    script += `remove_deleted_path ${shellQuote(assertPlanPath(relative))}\n`;
   }
 
   script += ': > "$expected"\n';
@@ -134,17 +186,19 @@ mkdir -p "$staging"
   }
   script += `LC_ALL=C sort -o "$expected" "$expected"
 : > "$actual"
-tar -tzf "$archive" | while IFS= read -r item; do
+tar -tzf "$archive" > "$raw"
+while IFS= read -r item; do
   item=$(printf '%s' "$item" | sed 's#^\\./##; s#/$##')
   [ -z "$item" ] && continue
   case "$item" in /*|*\\\\*|*:*|../*|*/../*|*/..|..) log 'unsafe_archive_path'; exit 1 ;; esac
-  printf '%s\\n' "$item"
-done | LC_ALL=C sort > "$actual"
+  printf '%s\\n' "$item" >> "$actual"
+done < "$raw"
+LC_ALL=C sort -o "$actual" "$actual"
 cmp -s "$expected" "$actual" || { log 'archive_entries_mismatch'; exit 1; }
 tar -xzf "$archive" -C "$staging"
 `;
 
-  for (const record of files) {
+  for (const record of verifyFiles) {
     const absolute = `"$staging"/${shellQuote(record.path)}`;
     if (record.type === 'symlink') {
       script += `[ -L ${absolute} ] || { log ${shellQuote(`missing_update_link:${record.path}`)}; exit 1; }
@@ -164,7 +218,11 @@ tar -xzf "$archive" -C "$staging"
   }
 
   if (plan.platform === 'darwin') {
-    script += `if codesign -dv "$staging" >/dev/null 2>&1; then
+    script += `target_was_signed=0
+if codesign -dv "$target" >/dev/null 2>&1; then target_was_signed=1; fi
+if [ "$target_was_signed" -eq 1 ]; then
+  codesign --verify --deep --strict "$staging" || { log 'replacement_signature_invalid'; exit 1; }
+elif codesign -dv "$staging" >/dev/null 2>&1; then
   codesign --verify --deep --strict "$staging"
 fi
 `;
@@ -199,14 +257,16 @@ cleanup() {
   trap - EXIT INT TERM HUP
   if [ "$success" -ne 1 ]; then
     log "Update failed with status $status"
+    notify_update 'Update failed. Restoring the previous version.'
     rm -f "$staging" 2>/dev/null || true
     if [ "$swapped" -eq 1 ] && [ -e "$backup" ]; then
       rm -f "$target" 2>/dev/null || true
       mv "$backup" "$target" 2>/dev/null || true
     fi
-    if [ -f "$target" ]; then chmod +x "$target" 2>/dev/null || true; nohup "$target" >/dev/null 2>&1 & fi
+    if [ "$application_exit_timeout" -ne 1 ] && [ -f "$target" ]; then chmod +x "$target" 2>/dev/null || true; nohup "$target" >/dev/null 2>&1 & fi
   fi
   if [ "$success" -eq 1 ]; then rm -f "$backup" 2>/dev/null || true; fi
+  if [ "$success" -eq 1 ]; then rm -f "$archive" 2>/dev/null || true; fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
@@ -221,7 +281,7 @@ rm -f "$staging" "$backup"
       const block = blocks[index];
       const source = Number.isSafeInteger(block.deltaIndex) ? '$archive' : '$target';
       const sourceIndex = Number.isSafeInteger(block.deltaIndex) ? block.deltaIndex : index;
-      script += `dd if="${source}" bs=${plan.blockSize} skip=${sourceIndex} count=1 2>/dev/null >> "$staging"\n`;
+      script += `dd if="${source}" bs=${plan.blockSize} iflag=fullblock skip=${sourceIndex} count=1 2>/dev/null >> "$staging"\n`;
     }
   }
   script += `[ "$(file_size "$staging")" = ${shellQuote(plan.targetSize)} ] || { log 'appimage_size_mismatch'; exit 1; }

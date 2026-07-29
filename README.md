@@ -2,12 +2,13 @@
 
 这是一个快速验证 N.E.K.O Portable 更新链路的独立 Windows 测试项目。它的界面和后端很小：Electron 页面会显示版本与色彩主题，并启动一个 FastAPI `/api/status` 服务；升级至新版本后，版本号、主题颜色和文字会明显变化。
 
-更新部分不是重新实现：以下文件逐字复制自 `D:\xxynet\N.E.K.O.-PC`，可以用 `npm run check:updater-parity` 验证哈希一致。
+更新部分不是重新实现：以下四个文件逐字复制自 `D:\xxynet\N.E.K.O.-PC`，可以用 `npm run check:updater-parity` 验证哈希一致。
 
-- `src/main/portable-update.js`：manifest 校验、全量/差分选择、下载、SHA-256 校验、Windows PowerShell 原子应用与回滚。
 - `src/main/portable-update-posix.js`：macOS/Linux 辅助应用器（保留以保证代码基线一致）。
 - `src/main/update-source.js`、`src/main/update-check-service.js`：统一更新服务兼容 GitHub Release 的检查、回退与对话框逻辑。
 - `scripts/create-portable-update.js`：全量 ZIP、文件级差分和 manifest 生成器。
+
+`src/main/portable-update.js` 同步 PC 的运行时更新行为（包括 PowerShell 进度、超时和回滚逻辑），但有意不启用正式发行专用的 Authenticode 白名单与 Ed25519 manifest 签名验证：本项目构建的是未签名的 E2E 测试包，本地更新服务也不会生成 `.sig` 文件。
 
 因此这个项目有意维持 `N.E.K.O_*` 资源命名、`N.E.K.O` product、`N.E.K.O.exe` 入口及 `/v1/download/N.E.K.O/...` 路由；它验证的是现有实现，而不是抽象后的新协议。
 

@@ -3,7 +3,11 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
-const { createPortableUpdater, getDistributionMarker } = require('./portable-update');
+const {
+  createElectronNetTransport,
+  createPortableUpdater,
+  getDistributionMarker,
+} = require('./portable-update');
 const {
   buildUpdateServiceReleaseUrl,
   getConfiguredUpdateServiceBaseUrl,
@@ -12,12 +16,14 @@ const {
 const DEFAULT_RELEASE_API_URL = 'https://api.github.com/repos/Project-N-E-K-O/N.E.K.O/releases/latest';
 const DEFAULT_RELEASES_URL_PREFIX = 'https://github.com/Project-N-E-K-O/N.E.K.O/releases/';
 const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
+const ALLOWED_RELEASE_REPOSITORIES = new Set([DEFAULT_RELEASE_REPOSITORY]);
 const PORTABLE_TEST_RELEASE_SELECTOR = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)@(stable|nightly)$/;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEVELOPMENT_DOWNLOAD_SIMULATION_MS = 10000;
 const DEVELOPMENT_DOWNLOAD_SIMULATION_STEPS = 20;
 const DEVELOPMENT_DOWNLOAD_SIMULATION_BYTES = 10 * 1024 * 1024;
+const PORTABLE_UPDATE_STATE_FILE = 'portable-update-state.json';
 
 function normalizeVersion(value) {
   const raw = String(value || '').trim().replace(/^v/i, '');
@@ -82,7 +88,10 @@ function detectDistributionMode(app, processRef = process) {
     const isCommonInstallLocation = installedRoots.some((root) => (
       normalizedExecutableDir === root || normalizedExecutableDir.startsWith(`${root}${path.sep}`)
     ));
-    if (path.dirname(resourcesDir) === executableDir && fs.existsSync(appAsarPath) && !isCommonInstallLocation) {
+    const isSquirrelInstall = !!env.LOCALAPPDATA && /^app-[^\\/]+$/i.test(path.basename(executableDir))
+      && path.dirname(executableDir).toLowerCase() !== path.resolve(env.LOCALAPPDATA).toLowerCase();
+    if (path.dirname(resourcesDir) === executableDir && fs.existsSync(appAsarPath)
+      && !isCommonInstallLocation && !isSquirrelInstall) {
       return 'portable';
     }
   }
@@ -91,10 +100,34 @@ function detectDistributionMode(app, processRef = process) {
 
 function getNightlyTestReleaseConfig(app, processRef = process) {
   if (app?.isPackaged !== true || detectDistributionMode(app, processRef) !== 'portable') return null;
-  const selector = String(processRef?.env?.NEKO_PORTABLE_UPDATE_TEST_RELEASE || '').trim();
-  const match = selector.match(PORTABLE_TEST_RELEASE_SELECTOR);
-  if (!match) return null;
-  const [, repository, channel] = match;
+  let repository = '';
+  let channel = '';
+  let bundledTestBuild = false;
+  const resourcesPath = String(processRef?.resourcesPath || '').trim();
+  if (resourcesPath) {
+    try {
+      const bundledConfig = JSON.parse(fs.readFileSync(path.join(resourcesPath, 'core_config.txt'), 'utf8'));
+      if (bundledConfig?.portableUpdateTestBuild === true) {
+        bundledTestBuild = true;
+        repository = String(bundledConfig.portableUpdateTestRepository || '').trim();
+        channel = String(bundledConfig.portableUpdateTestChannel || '').trim();
+        if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)
+          || !['stable', 'nightly'].includes(channel)) return null;
+      }
+    } catch (_) {
+      // Fall back to the legacy environment variable below.
+    }
+  }
+  if (!repository) {
+    const selector = String(processRef?.env?.NEKO_PORTABLE_UPDATE_TEST_RELEASE || '').trim();
+    const match = selector.match(PORTABLE_TEST_RELEASE_SELECTOR);
+    if (!match) return null;
+    [, repository, channel] = match;
+  }
+  const isOfficialRepository = ALLOWED_RELEASE_REPOSITORIES.has(repository);
+  const isBundledTestRepository = bundledTestBuild && repository && resourcesPath && channel
+    && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository);
+  if (!isOfficialRepository && !isBundledTestRepository) return null;
   const tag = channel === 'nightly' ? 'nightly' : null;
   return {
     repository,
@@ -118,12 +151,18 @@ function getPortableReleaseVersion(release) {
   return versions.size === 1 ? [...versions][0] : null;
 }
 
-function isAllowedReleaseUrl(value, releaseRepository = DEFAULT_RELEASE_REPOSITORY, allowTestRepository = false) {
+function isAllowedReleaseUrl(
+  value,
+  releaseRepository = DEFAULT_RELEASE_REPOSITORY,
+  allowTestRepository = false,
+  testReleaseRepository = null,
+) {
   try {
     const url = new URL(String(value || ''));
     return url.protocol === 'https:'
       && url.hostname === 'github.com'
-      && (releaseRepository === DEFAULT_RELEASE_REPOSITORY || allowTestRepository)
+      && (ALLOWED_RELEASE_REPOSITORIES.has(releaseRepository)
+        || (allowTestRepository && releaseRepository === testReleaseRepository))
       && url.pathname.startsWith(`/${releaseRepository}/releases/`);
   } catch (_) {
     return false;
@@ -137,6 +176,7 @@ function createUpdateCheckService(context = {}) {
     shell,
     http: httpRef = http,
     https,
+    net,
     process: processRef = process,
     log = () => {},
     releaseApiUrl = DEFAULT_RELEASE_API_URL,
@@ -146,6 +186,7 @@ function createUpdateCheckService(context = {}) {
     showUpdateNotice,
     showUpdatePrompt,
     setTimeout: setTimeoutRef = setTimeout,
+    autoCheckEnabled = true,
   } = context;
 
   const portableTestRelease = getNightlyTestReleaseConfig(app, processRef);
@@ -166,11 +207,13 @@ function createUpdateCheckService(context = {}) {
   const updateServiceReleaseApiUrl = canUseUpdateService
     ? buildUpdateServiceReleaseUrl(updateServiceBaseUrl, updateServiceChannel)
     : null;
+  const electronNetTransport = createElectronNetTransport(net);
 
   const portableUpdater = context.portableUpdater || createPortableUpdater({
     app,
     http: httpRef,
     https,
+    net,
     process: processRef,
     log,
     quit,
@@ -181,6 +224,7 @@ function createUpdateCheckService(context = {}) {
 
   let started = false;
   let checkPromise = null;
+  let updatePromptPromise = null;
 
   function writeLog(...args) {
     try { log(...args); } catch (_) {}
@@ -240,6 +284,36 @@ function createUpdateCheckService(context = {}) {
     return distributionMode === 'portable';
   }
 
+  function getSkippedVersion() {
+    const userData = app?.getPath?.('userData');
+    if (!userData) return null;
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(userData, PORTABLE_UPDATE_STATE_FILE), 'utf8'));
+      const key = portableTestRelease?.repository || DEFAULT_RELEASE_REPOSITORY;
+      return state?.skippedVersions?.[key] || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveSkippedVersion(version) {
+    const userData = app?.getPath?.('userData');
+    if (!userData) return;
+    try {
+      const statePath = path.join(userData, PORTABLE_UPDATE_STATE_FILE);
+      let state = {};
+      try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch (_) {}
+      const skippedVersions = state && typeof state.skippedVersions === 'object'
+        ? state.skippedVersions
+        : {};
+      skippedVersions[portableTestRelease?.repository || DEFAULT_RELEASE_REPOSITORY] = version;
+      fs.mkdirSync(userData, { recursive: true });
+      fs.writeFileSync(statePath, `${JSON.stringify({ skippedVersions }, null, 2)}\n`, 'utf8');
+    } catch (error) {
+      writeLog('[Update] 保存跳过版本失败:', error?.message || error);
+    }
+  }
+
   function getCurrentVersion() {
     if (isForcedDevelopmentCheck()) {
       const testVersion = String(processRef?.env?.NEKO_UPDATE_TEST_VERSION || '').trim();
@@ -272,7 +346,7 @@ function createUpdateCheckService(context = {}) {
         reject(new Error('update_check_url_invalid'));
         return;
       }
-      const transport = url.protocol === 'http:' ? httpRef : https;
+      const transport = electronNetTransport || (url.protocol === 'http:' ? httpRef : https);
       if (!transport || typeof transport.get !== 'function') {
         reject(new Error(`${url.protocol === 'http:' ? 'http' : 'https'}_unavailable`));
         return;
@@ -405,7 +479,7 @@ function createUpdateCheckService(context = {}) {
           '',
           resolved ? (isSimulation ? '是否开始模拟下载？此操作只验证托盘进度，不会下载、替换文件或退出应用。' : '是否下载并自动更新？应用将在下载完成后自动退出、更新并重新启动。') : '此版本未提供 Portable 更新清单，是否前往 GitHub 手动下载？',
         ].filter((line, index) => line || index === 3).join('\n'),
-        buttons: [resolved ? '下载并更新' : '前往下载', '稍后'],
+        buttons: [resolved ? '下载并更新' : '前往下载', '稍后', '跳过此版本'],
       };
     }
     return {
@@ -420,7 +494,7 @@ function createUpdateCheckService(context = {}) {
         '',
         resolved ? (isSimulation ? 'Start the simulated download? This only verifies tray progress; no files are downloaded or replaced, and the app stays open.' : 'Download and install it now? The app will exit, update, and restart after downloading.') : 'No Portable update manifest is available. Open GitHub for a manual download?',
       ].filter((line, index) => line || index === 3).join('\n'),
-      buttons: [resolved ? 'Download and Update' : 'Open Download Page', 'Later'],
+      buttons: [resolved ? 'Download and Update' : 'Open Download Page', 'Later', 'Skip This Version'],
     };
   }
 
@@ -456,7 +530,12 @@ function createUpdateCheckService(context = {}) {
     resolved,
     githubFallbackFactory = null,
   ) {
-    const releaseUrl = isAllowedReleaseUrl(release?.html_url, releaseRepository, !!portableTestRelease)
+    const releaseUrl = isAllowedReleaseUrl(
+      release?.html_url,
+      releaseRepository,
+      !!portableTestRelease,
+      portableTestRelease?.repository,
+    )
       ? release.html_url
       : `${releasesUrlPrefix}${isNightlyTestRelease ? 'tag/nightly' : 'latest'}`;
     const copy = getDialogCopy(currentVersion, latestVersion, release?.name, resolved);
@@ -468,7 +547,13 @@ function createUpdateCheckService(context = {}) {
         detail: copy.detail,
         primaryLabel: copy.buttons[0],
         secondaryLabel: copy.buttons[1],
-      }) === 'primary';
+        tertiaryLabel: copy.buttons[2],
+      });
+      if (accepted === 'tertiary') {
+        saveSkippedVersion(latestVersion);
+        return false;
+      }
+      accepted = accepted === 'primary';
     } else {
       if (!dialog || typeof dialog.showMessageBox !== 'function') return false;
       const result = await dialog.showMessageBox({
@@ -481,6 +566,10 @@ function createUpdateCheckService(context = {}) {
         cancelId: 1,
         noLink: true,
       });
+      if (result?.response === 2) {
+        saveSkippedVersion(latestVersion);
+        return false;
+      }
       accepted = result?.response === 0;
     }
     if (!accepted) return false;
@@ -505,11 +594,15 @@ function createUpdateCheckService(context = {}) {
             : (total > 0 ? Math.max(0, Math.min(100, Math.floor((received / total) * 100))) : null);
           emitStatus({ ...baseStatus, received, total, percent });
         };
+        const onStage = (stage = {}) => {
+          if (stage.phase !== 'installing') return;
+          emitStatus({ ...baseStatus, phase: 'installing', received: baseStatus.total, percent: 100 });
+        };
         if (isDevelopmentDownloadSimulation()) {
           writeLog('[Update] 开始开发模式模拟下载，不会修改应用文件');
           await simulateDevelopmentDownload(onProgress);
         } else {
-          await portableUpdater.downloadAndApply(resolved, { onProgress });
+          await portableUpdater.downloadAndApply(resolved, { onProgress, onStage });
         }
         emitStatus({ phase: 'idle' });
         return true;
@@ -539,8 +632,13 @@ function createUpdateCheckService(context = {}) {
                 : (total > 0 ? Math.max(0, Math.min(100, Math.floor((received / total) * 100))) : null);
               emitStatus({ ...fallbackStatus, received, total, percent });
             };
+            const onFallbackStage = (stage = {}) => {
+              if (stage.phase !== 'installing') return;
+              emitStatus({ ...fallbackStatus, phase: 'installing', received: fallbackStatus.total, percent: 100 });
+            };
             await portableUpdater.downloadAndApply(fallback.resolved, {
               onProgress: onFallbackProgress,
+              onStage: onFallbackStage,
             });
             emitStatus({ phase: 'idle' });
             return true;
@@ -562,9 +660,9 @@ function createUpdateCheckService(context = {}) {
     return true;
   }
 
-  async function checkNow() {
-    if (checkPromise) return checkPromise;
-    checkPromise = (async () => {
+  async function checkNow(options = {}) {
+    const awaitPrompt = options.awaitPrompt !== false;
+    if (!checkPromise) checkPromise = (async () => {
       if (!shouldCheck()) {
         return { checked: false, reason: 'distribution_skipped' };
       }
@@ -583,18 +681,33 @@ function createUpdateCheckService(context = {}) {
           : await requestLatestRelease();
         let { release } = releaseResult;
         let releaseSource = releaseResult.source;
-        const latestVersion = isNightlyTestRelease
+        let latestVersion = isNightlyTestRelease
           ? getPortableReleaseVersion(release)
           : String(release?.tag_name || '').trim().replace(/^v/i, '');
-        const comparison = isNightlyTestRelease
+        let comparison = isNightlyTestRelease
           ? (latestVersion ? (latestVersion === currentVersion ? 0 : 1) : null)
           : compareVersions(latestVersion, currentVersion);
         if (comparison === null) {
-          throw new Error(`update_check_invalid_version:${release?.tag_name || '<missing>'}`);
+          if (releaseSource !== 'update-service') {
+            throw new Error(`update_check_invalid_version:${release?.tag_name || '<missing>'}`);
+          }
+          writeLog('[Update] 统一更新服务版本无效，回退 GitHub:', release?.tag_name || '<missing>');
+          const fallback = await resolveGitHubFallback(currentVersion, null, { requireManifest: false });
+          release = fallback.release;
+          latestVersion = fallback.latestVersion;
+          releaseSource = 'github';
+          comparison = isNightlyTestRelease
+            ? (latestVersion === currentVersion ? 0 : 1)
+            : compareVersions(latestVersion, currentVersion);
         }
         if (comparison <= 0) {
           writeLog('[Update] 当前已是最新版本:', currentVersion);
           return { checked: true, updateAvailable: false, currentVersion, latestVersion };
+        }
+
+        if (getSkippedVersion() === latestVersion) {
+          writeLog('[Update] 跳过已记录的版本:', latestVersion);
+          return { checked: true, updateAvailable: false, reason: 'skipped_version', currentVersion, latestVersion };
         }
 
         writeLog('[Update] 发现新版本:', `${currentVersion} -> ${latestVersion}`);
@@ -641,19 +754,18 @@ function createUpdateCheckService(context = {}) {
         const githubFallbackFactory = releaseSource === 'update-service' && resolved
           ? () => resolveGitHubFallback(currentVersion, effectiveLatestVersion)
           : null;
-        const startedUpdate = await promptForUpdate(
-          release,
-          currentVersion,
-          effectiveLatestVersion,
-          resolved,
-          githubFallbackFactory,
-        );
         return {
           checked: true,
           updateAvailable: true,
           currentVersion,
           latestVersion: effectiveLatestVersion,
-          startedUpdate,
+          promptForUpdate: () => promptForUpdate(
+            release,
+            currentVersion,
+            effectiveLatestVersion,
+            resolved,
+            githubFallbackFactory,
+          ),
         };
       } catch (error) {
         writeLog('[Update] 检查失败:', error?.message || error);
@@ -661,7 +773,24 @@ function createUpdateCheckService(context = {}) {
       }
     })();
     try {
-      return await checkPromise;
+      const result = await checkPromise;
+      if (!result?.promptForUpdate) return result;
+      const { promptForUpdate: runPrompt, ...checkResult } = result;
+      if (!updatePromptPromise) {
+        updatePromptPromise = Promise.resolve()
+          .then(runPrompt)
+          .catch((error) => {
+            writeLog('[Update] 更新提示失败:', error?.message || error);
+            return false;
+          })
+          .finally(() => {
+            updatePromptPromise = null;
+          });
+      }
+      if (!awaitPrompt) {
+        return { ...checkResult, startedUpdate: false, promptPending: true };
+      }
+      return { ...checkResult, startedUpdate: await updatePromptPromise };
     } finally {
       checkPromise = null;
     }
@@ -670,11 +799,15 @@ function createUpdateCheckService(context = {}) {
   function start() {
     if (started) return false;
     started = true;
+    if (autoCheckEnabled !== true && !isForcedDevelopmentCheck()) {
+      writeLog('[Update] 用户已关闭自动更新检查');
+      return false;
+    }
     if (!shouldCheck()) {
       writeLog('[Update] 当前发行模式跳过更新检查:', detectDistributionMode(app, processRef));
       return false;
     }
-    void checkNow();
+    void checkNow({ awaitPrompt: false });
     return true;
   }
 
