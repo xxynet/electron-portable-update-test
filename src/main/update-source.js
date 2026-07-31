@@ -3,6 +3,7 @@
 const net = require('node:net');
 const DEFAULT_UPDATE_SERVICE_URL = 'https://update.project-neko.cn';
 const UPDATE_SERVICE_URL_ENV = 'NEKO_UPDATE_SERVICE_URL';
+const PORTABLE_UPDATE_PRODUCT_ID = 'N.E.K.O-Portable-Update-Test';
 
 function isLoopbackHostname(hostname) {
   const normalized = String(hostname || '').toLowerCase();
@@ -35,10 +36,11 @@ function getConfiguredUpdateServiceBaseUrl(processRef = process) {
 
 function buildUpdateServiceReleaseUrl(baseUrl, channel = 'stable') {
   const base = normalizeUpdateServiceBaseUrl(baseUrl);
+  const product = encodeURIComponent(PORTABLE_UPDATE_PRODUCT_ID);
   if (channel === 'nightly') {
-    return `${base}/v1/compat/github/N.E.K.O/nightly/releases/tags/nightly`;
+    return `${base}/v1/compat/github/${product}/nightly/releases/tags/nightly`;
   }
-  return `${base}/v1/compat/github/N.E.K.O/stable/releases/latest`;
+  return `${base}/v1/compat/github/${product}/stable/releases/latest`;
 }
 
 function isUpdateServiceDownloadUrl(value, baseUrl) {
@@ -48,7 +50,7 @@ function isUpdateServiceDownloadUrl(value, baseUrl) {
     const url = new URL(String(value || ''));
     if (url.origin !== base.origin || url.username || url.password || url.hash) return false;
     const basePath = base.pathname.replace(/\/+$/, '');
-    const downloadPrefix = `${basePath}/v1/download/N.E.K.O/`;
+    const downloadPrefix = `${basePath}/v1/download/${encodeURIComponent(PORTABLE_UPDATE_PRODUCT_ID)}/`;
     return url.pathname.startsWith(downloadPrefix);
   } catch (_) {
     return false;
@@ -76,6 +78,7 @@ function isAllowedUpdateRedirectUrl(value, allowUpdateServiceMirrors = false) {
 
 module.exports = {
   DEFAULT_UPDATE_SERVICE_URL,
+  PORTABLE_UPDATE_PRODUCT_ID,
   UPDATE_SERVICE_URL_ENV,
   buildUpdateServiceReleaseUrl,
   getConfiguredUpdateServiceBaseUrl,

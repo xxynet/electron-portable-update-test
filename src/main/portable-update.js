@@ -24,7 +24,7 @@ const MAX_REDIRECTS = 5;
 const MAX_NETWORK_RETRIES = 2;
 const NETWORK_RETRY_DELAY_MS = 500;
 const SUPPORTED_ARCHES = new Set(['x64', 'arm64']);
-const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
+const DEFAULT_RELEASE_REPOSITORY = 'xxynet/electron-portable-update-test';
 const MANAGED_FILES_NAME = 'neko-portable-managed-files.json';
 const ALLOWED_RELEASE_REPOSITORIES = new Set([
   DEFAULT_RELEASE_REPOSITORY,

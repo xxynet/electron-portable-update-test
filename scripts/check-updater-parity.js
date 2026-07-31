@@ -8,8 +8,6 @@ const ROOT = path.resolve(__dirname, '..');
 const SOURCE = path.resolve(ROOT, '..', 'N.E.K.O.-PC');
 const FILES = [
   'src/main/portable-update-posix.js',
-  'src/main/update-source.js',
-  'src/main/update-check-service.js',
   'scripts/create-portable-update.js',
 ];
 
@@ -17,7 +15,11 @@ const FILES = [
 // deliberately emits unsigned manifests.  Its Windows updater therefore
 // tracks the PC implementation's functional behavior but excludes the
 // production-only Authenticode and detached-manifest signature gates.
-const TEST_ONLY_VARIANT = 'src/main/portable-update.js';
+const TEST_ONLY_VARIANTS = [
+  'src/main/update-source.js',
+  'src/main/update-check-service.js',
+  'src/main/portable-update.js',
+];
 
 function hash(file) { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); }
 
@@ -30,5 +32,5 @@ for (const relative of FILES) {
     failed = true;
   } else console.log(`OK: ${relative}`);
 }
-console.log(`TEST-ONLY VARIANT: ${TEST_ONLY_VARIANT} (unsigned local E2E artifacts)`);
+console.log(`TEST-ONLY VARIANTS: ${TEST_ONLY_VARIANTS.join(', ')} (isolated product ID, test GitHub fallback, and unsigned local E2E artifacts)`);
 if (failed) process.exitCode = 1;

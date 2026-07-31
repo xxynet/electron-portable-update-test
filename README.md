@@ -2,15 +2,14 @@
 
 这是一个快速验证 N.E.K.O Portable 更新链路的独立 Windows 测试项目。它的界面和后端很小：Electron 页面会显示版本与色彩主题，并启动一个 FastAPI `/api/status` 服务；升级至新版本后，版本号、主题颜色和文字会明显变化。
 
-更新部分不是重新实现：以下四个文件逐字复制自 `D:\xxynet\N.E.K.O.-PC`，可以用 `npm run check:updater-parity` 验证哈希一致。
+更新核心中，以下两个文件逐字复制自 `D:\xxynet\N.E.K.O.-PC`，可以用 `npm run check:updater-parity` 验证哈希一致。
 
 - `src/main/portable-update-posix.js`：macOS/Linux 辅助应用器（保留以保证代码基线一致）。
-- `src/main/update-source.js`、`src/main/update-check-service.js`：统一更新服务兼容 GitHub Release 的检查、回退与对话框逻辑。
 - `scripts/create-portable-update.js`：全量 ZIP、文件级差分和 manifest 生成器。
 
-`src/main/portable-update.js` 同步 PC 的运行时更新行为（包括 PowerShell 进度、超时和回滚逻辑），但有意不启用正式发行专用的 Authenticode 白名单与 Ed25519 manifest 签名验证：本项目构建的是未签名的 E2E 测试包，本地更新服务也不会生成 `.sig` 文件。
+`src/main/update-source.js`、`src/main/update-check-service.js` 和 `src/main/portable-update.js` 保持上游更新行为，但有意使用隔离的 `N.E.K.O-Portable-Update-Test` 产品 ID、测试仓库 GitHub 回退源，并不启用正式发行专用的 Authenticode 白名单与 Ed25519 manifest 签名验证：本项目构建的是未签名的 E2E 测试包，本地更新服务也不会生成 `.sig` 文件。
 
-因此这个项目有意维持 `N.E.K.O_*` 资源命名、`N.E.K.O` product、`N.E.K.O.exe` 入口及 `/v1/download/N.E.K.O/...` 路由；它验证的是现有实现，而不是抽象后的新协议。
+因此这个项目有意维持 `N.E.K.O_*` 资源命名、manifest 中的 `N.E.K.O` product、`N.E.K.O.exe` 入口；更新服务路由则使用隔离的 `/v1/download/N.E.K.O-Portable-Update-Test/...`，避免测试版本进入正式产品通道。
 
 ## 准备
 
@@ -84,8 +83,8 @@ demo 不传 `--accent`：Ocean 使用 `#5b8cff`，Aurora 使用 `#2dd4bf`。手�
 它会：
 
 1. 用当前 `N.E.K.O.-Update` 的 `create_app()` 启动本地更新服务，并注册 1.0.1 的真实产物。
-2. 通过同样的 GitHub 兼容端点返回 Release JSON：`/v1/compat/github/N.E.K.O/stable/releases/latest`。
-3. 通过同样的镜像调度下载端点返回 307：`/v1/download/N.E.K.O/stable/<version>/<asset>`；仅本地回环地址允许 HTTP。
+2. 通过隔离产品的 GitHub 兼容端点返回 Release JSON：`/v1/compat/github/N.E.K.O-Portable-Update-Test/stable/releases/latest`。
+3. 通过隔离产品的镜像调度下载端点返回 307：`/v1/download/N.E.K.O-Portable-Update-Test/stable/<version>/<asset>`；仅本地回环地址允许 HTTP。
 4. 启动 1.0.0 的真实 unpacked Portable 应用。点击“检查并应用 Portable 更新”，在原版原生确认框选择更新；应用会先等待后台助手写入“已接管”标记，确认后才退出。
 5. 更新器下载并验证差分 ZIP，应用退出后由 PowerShell 辅助程序替换文件并重启为 1.0.1。页面应显示 `v1.0.1`、`Aurora` 和 `#2dd4bf` 对应的主题色。
 

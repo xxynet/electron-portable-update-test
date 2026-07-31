@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_UPDATE_SOURCE = ROOT.parent / "N.E.K.O.-Update"
 VERSION_RE = re.compile(r"^N\.E\.K\.O_(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)_win_manifest\.json$")
+PRODUCT_ID = "N.E.K.O-Portable-Update-Test"
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +52,7 @@ def main() -> None:
         admin_token="",
         github_token=None,
         country_headers=(),
-        products={"N.E.K.O": Product(github_repository="local/electron-portable-update-test", asset_prefix="N.E.K.O", channels={"stable": Channel()})},
+        products={PRODUCT_ID: Product(github_repository="local/electron-portable-update-test", asset_prefix="N.E.K.O", channels={"stable": Channel()})},
         mirrors={"local": Mirror(id="local", base_url=f"{base}/assets", path_template="{name}")},
     )
     app = create_app(settings)
@@ -68,7 +69,7 @@ def main() -> None:
             "sha256": None,
             "mirrors": ["local"],
         })
-    store.upsert_release(product="N.E.K.O", channel="stable", source="local-test", release={
+    store.upsert_release(product=PRODUCT_ID, channel="stable", source="local-test", release={
         "version": version,
         "tag": f"v{version}",
         "name": f"Portable update test {version}",
@@ -80,8 +81,8 @@ def main() -> None:
         "assets": assets,
     })
     app.mount("/assets", StaticFiles(directory=release_dir), name="assets")
-    print(f"Serving N.E.K.O v{version} through N.E.K.O.-Update at {base}")
-    print(f"Release endpoint: {base}/v1/compat/github/N.E.K.O/stable/releases/latest")
+    print(f"Serving {PRODUCT_ID} v{version} through N.E.K.O.-Update at {base}")
+    print(f"Release endpoint: {base}/v1/compat/github/{PRODUCT_ID}/stable/releases/latest")
     uvicorn.run(app, host="127.0.0.1", port=args.port)
 
 

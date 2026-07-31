@@ -13,9 +13,9 @@ const {
   getConfiguredUpdateServiceBaseUrl,
 } = require('./update-source');
 
-const DEFAULT_RELEASE_API_URL = 'https://api.github.com/repos/Project-N-E-K-O/N.E.K.O/releases/latest';
-const DEFAULT_RELEASES_URL_PREFIX = 'https://github.com/Project-N-E-K-O/N.E.K.O/releases/';
-const DEFAULT_RELEASE_REPOSITORY = 'Project-N-E-K-O/N.E.K.O';
+const DEFAULT_RELEASE_API_URL = 'https://api.github.com/repos/xxynet/electron-portable-update-test/releases/latest';
+const DEFAULT_RELEASES_URL_PREFIX = 'https://github.com/xxynet/electron-portable-update-test/releases/';
+const DEFAULT_RELEASE_REPOSITORY = 'xxynet/electron-portable-update-test';
 const ALLOWED_RELEASE_REPOSITORIES = new Set([DEFAULT_RELEASE_REPOSITORY]);
 const PORTABLE_TEST_RELEASE_SELECTOR = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)@(stable|nightly)$/;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
@@ -203,7 +203,7 @@ function createUpdateCheckService(context = {}) {
   }
   const updateServiceChannel = isNightlyTestRelease ? 'nightly' : 'stable';
   const canUseUpdateService = !!updateServiceBaseUrl
-    && (!portableTestRelease || releaseRepository === DEFAULT_RELEASE_REPOSITORY);
+    && !portableTestRelease;
   const updateServiceReleaseApiUrl = canUseUpdateService
     ? buildUpdateServiceReleaseUrl(updateServiceBaseUrl, updateServiceChannel)
     : null;
