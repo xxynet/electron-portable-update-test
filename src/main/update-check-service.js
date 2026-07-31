@@ -601,10 +601,13 @@ function createUpdateCheckService(context = {}) {
         if (isDevelopmentDownloadSimulation()) {
           writeLog('[Update] 开始开发模式模拟下载，不会修改应用文件');
           await simulateDevelopmentDownload(onProgress);
+          emitStatus({ phase: 'idle' });
         } else {
           await portableUpdater.downloadAndApply(resolved, { onProgress, onStage });
+          // The helper owns the remainder of the update after it asks this process to quit.
+          // Keep the warning visible so no second helper can be launched during that window.
+          emitStatus({ ...baseStatus, phase: 'installing', received: baseStatus.total, percent: 100 });
         }
-        emitStatus({ phase: 'idle' });
         return true;
       } catch (error) {
         if (typeof githubFallbackFactory === 'function') {
@@ -640,7 +643,7 @@ function createUpdateCheckService(context = {}) {
               onProgress: onFallbackProgress,
               onStage: onFallbackStage,
             });
-            emitStatus({ phase: 'idle' });
+            emitStatus({ ...fallbackStatus, phase: 'installing', received: fallbackStatus.total, percent: 100 });
             return true;
           } catch (fallbackError) {
             emitStatus({ phase: 'idle' });
@@ -699,6 +702,9 @@ function createUpdateCheckService(context = {}) {
           comparison = isNightlyTestRelease
             ? (latestVersion === currentVersion ? 0 : 1)
             : compareVersions(latestVersion, currentVersion);
+          if (comparison === null) {
+            throw new Error(`update_check_invalid_version:${release?.tag_name || '<missing>'}`);
+          }
         }
         if (comparison <= 0) {
           writeLog('[Update] 当前已是最新版本:', currentVersion);

@@ -165,7 +165,9 @@ remove_deleted_path() {
   for part in "$@"; do
     current="$current/$part"
     # Never traverse a user-provided symlink while handling a deletion.
-    if [ -L "$current" ]; then set +f; return 0; fi
+    # The deletion leaf itself may legitimately be an old managed symlink;
+    # only an ancestor must stop us from walking outside the staging tree.
+    if [ "$current" != "$staging/$relative" ] && [ -L "$current" ]; then set +f; return 0; fi
   done
   set +f
   # A release deletion only authorizes removal of the old managed leaf. If a

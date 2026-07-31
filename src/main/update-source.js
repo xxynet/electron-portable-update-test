@@ -1,7 +1,7 @@
 'use strict';
 
 const net = require('node:net');
-const DEFAULT_UPDATE_SERVICE_URL = 'https://update.project-neko.online';
+const DEFAULT_UPDATE_SERVICE_URL = 'https://update.project-neko.cn';
 const UPDATE_SERVICE_URL_ENV = 'NEKO_UPDATE_SERVICE_URL';
 
 function isLoopbackHostname(hostname) {
